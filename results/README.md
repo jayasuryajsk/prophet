@@ -103,16 +103,45 @@ Notable non-human traits, all living where the reward landscape is flat:
 
 These motivated the v3 changes (urgency discount, contempt, WDL).
 
-## v3 (run_v3): killer-instinct + calibration (in progress)
+## v3 (run_v3): warm-started reward-shaping — NEGATIVE RESULT
 
 Warm-started from v2's final checkpoint via in-place surgery — input widened
 18→24 features (last-2-move history + repetition flag, zero-initialized
 columns), scalar value head upgraded to a WDL (win/draw/loss) head
 initialized to reproduce the old value. Plus: draw **contempt** (−0.15),
 per-ply **win-urgency** discount (0.997), **EMA** eval weights, and 2×
-self-play search depth (32 sims). Interim: 1236 Elo at 27k games — strength
-preserved through the surgery, recalibration still settling. Full result and
-a before/after game census (does it still slow-roll wins?) to follow.
+self-play search depth (32 sims). Run to ~35k games, then stopped.
+
+**Outcome: flat on every measured axis.** No gain over the 1255 baseline,
+and — tellingly — the *behavioral* targets didn't move either:
+
+| Signal | v2 final | v3 @30-35k |
+|---|---|---|
+| Elo @256 forwards | 1255 | 1236 |
+| Elo @1024 forwards | 1426 | 1282 |
+| Avg game length | 102 plies | 102–105 |
+| Decisive rate | 79% | 78–80% |
+
+Contempt and urgency exist to make the engine win faster and draw less; game
+length and decisive rate not moving means they were absorbed without effect.
+Interpretation: bolted onto a confident 100k-game brain, −0.15 contempt and
+a 0.997/ply discount are too gentle to repaint deeply grooved habits, and
+the WDL recalibration didn't raise the extraction ceiling at this scale. The
+deep-search gain even *shrank* (v2: +171 from 256→1024 forwards; v3: +46).
+
+Conclusion: reward-shaping + calibration changes, **warm-started at fixed
+size, move nothing**. The levers that work remain capacity and games — which
+motivated v4. The same changes may behave differently learned from scratch
+(where they shape play from move one), which v4 tests directly.
+
+## v4 (run_v4): from scratch, bigger net + v3 architecture (in progress)
+
+The honest follow-up to v3's negative result. From random weights, **6.47M
+params** (d=256, 8 layers; 2.3× v2), carrying all of v3's architecture
+(WDL head, history+repetition input, contempt, urgency, EMA) but now learned
+from birth rather than bolted on, study re-gated at 2000 games, self-play
+back to 16 sims (v3's 32 cost throughput for no measured benefit). Directly
+comparable to v2's from-scratch 1255. Result to follow.
 
 ## Reproducing the numbers
 
