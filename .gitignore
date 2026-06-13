@@ -1,0 +1,10 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+*.tmp
+
+# Working scratch dir — everything published is curated into results/ and
+# weights/. Full 1k-granularity checkpoint sets live in GitHub Releases.
+runs/

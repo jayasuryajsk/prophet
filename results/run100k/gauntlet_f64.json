@@ -1,0 +1,30 @@
+{
+  "ckpt": "runs/run100k/ckpt_100000.pt",
+  "rungs": {
+    "1320": [
+      9,
+      1,
+      20
+    ],
+    "1500": [
+      3,
+      1,
+      26
+    ],
+    "1700": [
+      0,
+      0,
+      30
+    ],
+    "2000": [
+      1,
+      0,
+      29
+    ]
+  },
+  "elo": 1163.6,
+  "bound": false,
+  "forwards_cap": 64,
+  "games_per_rung": 30,
+  "official": false
+}

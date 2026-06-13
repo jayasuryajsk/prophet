@@ -1,0 +1,11 @@
+# Core
+torch>=2.1
+python-chess>=1.11
+numpy>=1.26
+
+# Evaluation (gauntlet vs Stockfish) requires the `stockfish` binary on PATH:
+#   macOS:  brew install stockfish
+#   Linux:  apt-get install stockfish
+
+# NOTE: import torch BEFORE numpy in any entry point — on Homebrew Python,
+# numpy and torch each bundle libomp and only torch-first init is stable.
