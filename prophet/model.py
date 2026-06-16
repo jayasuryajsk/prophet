@@ -109,6 +109,9 @@ def load_checkpoint(path) -> PolicyQValueNet:
     sd = upgrade_state(sd, cfg)
     model = PolicyQValueNet(cfg)
     model.load_state_dict(sd)
+    # bring pre-history checkpoints (18-feature) up to the current input
+    # width with zero-padded columns, so encode_board's output matches
+    model = widen_input(model, FEATURES)
     model.eval()
     return model
 
