@@ -39,6 +39,7 @@ from prophet.model import (
     save_checkpoint,
     widen_input,
 )
+from prophet.accel import setup_perf
 from prophet.schedule import loss_weights_at
 from prophet.search import SearchConfig
 from prophet.train import collate, train_step
@@ -92,6 +93,7 @@ def main():
     ap.add_argument("--win-discount", type=float, default=0.997)
     ap.add_argument("--ema", type=float, default=0.999, help="weight EMA decay; checkpoints/evals use the EMA")
     ap.add_argument("--schedule", action="store_true", help="game-count curricula for study/q-trust/q-loss (moonshot)")
+    ap.add_argument("--compile", action="store_true", help="torch.compile worker inference (CUDA only)")
     args = ap.parse_args()
 
     out = Path(args.out)
@@ -109,6 +111,7 @@ def main():
 
     write_progress(0)
 
+    setup_perf(args.device)
     device = torch.device(args.device)
     torch.manual_seed(0)
     rng = np.random.default_rng(0)
@@ -131,6 +134,8 @@ def main():
     model = model.to(device)
     ema_model = copy.deepcopy(model)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    # learner speedup comes from bf16 autocast (train uses forward_wdl, which
+    # is off torch.compile's forward() path); workers compile their forward().
     save_checkpoint(ema_model, ckpt_path)
 
     search_cfg = SearchConfig(sims=args.sims, root_candidates=args.candidates)
@@ -162,6 +167,7 @@ def main():
                 search_kwargs, selfplay_kwargs, study_kwargs, model_kwargs,
                 args.batch_games, args.worker_threads, args.worker_device,
                 str(progress_path) if args.schedule else None,
+                args.compile,
             ),
             daemon=True,
         )

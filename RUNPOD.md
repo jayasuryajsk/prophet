@@ -46,7 +46,7 @@ before reaching for 10M.
 ```sh
 python3 scripts/train_loop.py \
   --games 100000 \
-  --device cuda --worker-device cuda \
+  --device cuda --worker-device cuda --compile \
   --workers 8 --batch-games 32 --worker-threads 2 \
   --d-model 256 --n-layers 8 --n-heads 8 \
   --sims 32 --candidates 12 \
@@ -60,7 +60,31 @@ python3 scripts/train_loop.py \
 ```
 
 `--workers 8` parallelizes the CPU-side tree ops across processes (tune to the
-box's core count); they share the GPU for batched inference.
+box's core count); they share the GPU for batched inference. `--compile`
+torch.compiles worker inference (one-time ~1-2 min per worker at startup).
+
+## CUDA optimizations (what's automatic on `--device cuda`)
+
+- **bf16 autocast** for self-play inference AND training (no GradScaler needed)
+  — typically ~2x on matmul-bound work. No-op off CUDA.
+- **TF32 + cuDNN autotuning** — free on Ampere+.
+- **`torch.compile` worker inference** (with `--compile`) — fixed batch size, so
+  no per-step recompile.
+- **`inference_mode`** for self-play forward.
+
+These are guarded so MPS/CPU runs are byte-for-byte unchanged.
+
+### Not yet optimized (the remaining big win)
+
+Each worker process holds its **own** model copy and hits the GPU with a
+batch-of-`batch_games` forward. On one GPU, N workers = N small batches
+serialized — the GPU is underutilized. The proper fix is a **central inference
+server**: many CPU worker processes for tree ops feeding ONE GPU process that
+batches all their leaf evals into large forwards (the KataGo/Leela design). That
+is the highest-value remaining optimization but a real rewrite; left for after
+the throughput probe tells us whether it's needed. Interim tuning: if the GPU is
+underutilized, use fewer workers with larger `--batch-games` (e.g. `--workers 4
+--batch-games 96`) to grow the per-forward batch.
 
 ## Step 3 — evaluate with cores FREE
 

@@ -7,6 +7,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from .accel import autocast
 from .encoding import NUM_ACTIONS
 
 
@@ -55,41 +56,42 @@ def collate(samples, device):
 def train_step(model, optimizer, batch, weights: LossWeights | None = None):
     w = weights or LossWeights()
     model.train()
-    logits, q, v, wdl_probs = model.forward_wdl(batch["x"])
+    with autocast(batch["x"].device):
+        logits, q, v, wdl_probs = model.forward_wdl(batch["x"])
 
-    wn = batch["weight"] / batch["weight"].mean().clamp_min(1e-8)
+        wn = batch["weight"] / batch["weight"].mean().clamp_min(1e-8)
 
-    masked = logits.masked_fill(~batch["mask"], float("-inf"))
-    logp = F.log_softmax(masked, dim=-1)
-    logp = torch.where(batch["mask"], logp, torch.zeros_like(logp))
-    loss_pi = (wn * -(batch["policy"] * logp).sum(dim=-1)).mean()
+        masked = logits.masked_fill(~batch["mask"], float("-inf"))
+        logp = F.log_softmax(masked, dim=-1)
+        logp = torch.where(batch["mask"], logp, torch.zeros_like(logp))
+        loss_pi = (wn * -(batch["policy"] * logp).sum(dim=-1)).mean()
 
-    loss_v = (wn * (v - batch["value"]).pow(2)).mean()
+        loss_v = (wn * (v - batch["value"]).pow(2)).mean()
 
-    qw = batch["q_weight"]
-    per_q = ((q - batch["q_target"]).pow(2) * qw).sum(dim=-1) / qw.sum(dim=-1).clamp_min(1.0)
-    # weight Q regression toward decisive positions so late-training drawish
-    # targets don't flatten the Q-head (the v1 Q-regression)
-    q_scale = 0.5 + batch["value"].abs()
-    loss_q = (wn * q_scale * per_q).mean()
+        qw = batch["q_weight"]
+        per_q = ((q - batch["q_target"]).pow(2) * qw).sum(dim=-1) / qw.sum(dim=-1).clamp_min(1.0)
+        # weight Q regression toward decisive positions so late-training drawish
+        # targets don't flatten the Q-head (the v1 Q-regression)
+        q_scale = 0.5 + batch["value"].abs()
+        loss_q = (wn * q_scale * per_q).mean()
 
-    has_wdl = batch["wdl"] >= 0
-    if has_wdl.any():
-        logp_wdl = torch.log(wdl_probs.clamp_min(1e-8))
-        nll = -logp_wdl.gather(1, batch["wdl"].clamp_min(0).unsqueeze(1)).squeeze(1)
-        loss_wdl = (wn * nll * has_wdl).sum() / has_wdl.sum().clamp_min(1)
-    else:
-        loss_wdl = torch.zeros((), device=v.device)
+        has_wdl = batch["wdl"] >= 0
+        if has_wdl.any():
+            logp_wdl = torch.log(wdl_probs.clamp_min(1e-8))
+            nll = -logp_wdl.gather(1, batch["wdl"].clamp_min(0).unsqueeze(1)).squeeze(1)
+            loss_wdl = (wn * nll * has_wdl).sum() / has_wdl.sum().clamp_min(1)
+        else:
+            loss_wdl = torch.zeros((), device=v.device)
 
-    with torch.no_grad():
-        _, _, v_child = model(batch["child_x"])
-    q_played = q.gather(1, batch["played"].unsqueeze(1)).squeeze(1)
-    loss_cons = (wn * (q_played + v_child).pow(2)).mean()
+        with torch.no_grad():
+            _, _, v_child = model(batch["child_x"])
+        q_played = q.gather(1, batch["played"].unsqueeze(1)).squeeze(1)
+        loss_cons = (wn * (q_played + v_child).pow(2)).mean()
 
-    loss = (
-        w.policy * loss_pi + w.value * loss_v + w.q * loss_q
-        + w.consistency * loss_cons + w.wdl * loss_wdl
-    )
+        loss = (
+            w.policy * loss_pi + w.value * loss_v + w.q * loss_q
+            + w.consistency * loss_cons + w.wdl * loss_wdl
+        )
     optimizer.zero_grad(set_to_none=True)
     loss.backward()
     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)

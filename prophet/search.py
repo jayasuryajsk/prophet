@@ -229,9 +229,12 @@ def run_search_gen(board: chess.Board, cfg: SearchConfig, rng: np.random.Generat
 
 @torch.no_grad()
 def _eval_single(model, x: np.ndarray, device):
+    from .accel import autocast, to_np
+
     xt = torch.from_numpy(x).unsqueeze(0).to(device)
-    logits, q, v = model(xt)
-    return logits[0].cpu().numpy(), q[0].cpu().numpy(), float(v[0])
+    with autocast(device):
+        logits, q, v = model(xt)
+    return to_np(logits[0]), to_np(q[0]), float(v[0])
 
 
 def drive(gen, model, device):

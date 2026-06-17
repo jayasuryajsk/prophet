@@ -18,6 +18,7 @@ from dataclasses import replace
 
 import numpy as np
 
+from .accel import autocast, maybe_compile, setup_perf, to_np
 from .model import ModelConfig, PolicyQValueNet, extract_state
 from .schedule import q_trust_at, study_config_at
 from .search import SearchConfig
@@ -72,11 +73,11 @@ def run_vector_selfplay(
         if on_round is not None and rounds % RELOAD_EVERY_ROUNDS == 0:
             on_round(rounds)
         xb = torch.from_numpy(np.stack(pending)).to(device)
-        with torch.no_grad():
+        with torch.inference_mode(), autocast(device):
             logits, q, v = model(xb)
-        logits = logits.cpu().numpy()
-        q = q.cpu().numpy()
-        v = v.cpu().numpy()
+        logits = to_np(logits)
+        q = to_np(q)
+        v = to_np(v)
         for i in range(len(gens)):
             try:
                 pending[i] = gens[i].send((logits[i], q[i], v[i]))
@@ -101,11 +102,14 @@ def vector_worker(
     threads: int = 2,
     device_str: str = "cpu",
     progress_path: str | None = None,
+    compile_model: bool = False,
 ):
     torch.set_num_threads(threads)
+    setup_perf(device_str)
     device = torch.device(device_str)
     model = PolicyQValueNet(ModelConfig(**model_kwargs)).to(device)
     model.eval()
+    model = maybe_compile(model, device, compile_model)
     master_rng = np.random.default_rng([worker_id, os.getpid()])
     scfg = SearchConfig(**search_kwargs)
     spcfg = SelfPlayConfig(**selfplay_kwargs)
