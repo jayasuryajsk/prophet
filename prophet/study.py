@@ -25,7 +25,7 @@ from dataclasses import dataclass
 import chess
 import numpy as np
 
-from .encoding import encode_board
+from .encoding import encode_board, index_to_move
 from .search import SearchConfig, _terminal_value, drive, run_search_gen
 from .selfplay import GameRecord, Sample
 
@@ -40,11 +40,21 @@ class StudyConfig:
     study_weight: float = 2.0
     branch_weight: float = 1.0
     outcome_mix: float = 0.5
+    n_lines: int = 1  # alternate lines explored per surprise position
+    q_surprise_weight: float = 1.0  # weight of Q-head surprise in detection
 
 
 def find_surprises(record: GameRecord, cfg: StudyConfig) -> list[int]:
-    """Indices of the most surprising plies, by blunder swing + outcome miss."""
+    """Indices of the most surprising plies, by:
+      - blunder swing: value flipped against the mover after the move
+      - outcome miss: search value disagreed with the eventual result
+      - Q-surprise: the Q-head's value for the move it played diverged from
+        what the move actually led to (negamax: Q(s,a) should = -V(child)).
+    Q-surprise is the move-level "my intuition was wrong here" signal —
+    exactly the positions worth re-studying along multiple lines.
+    """
     v = record.root_values
+    qhp = record.q_head_played
     z_white = {"1-0": 1.0, "0-1": -1.0, "1/2-1/2": 0.0}.get(record.result)
     mover_white = [fen.split()[1] == "w" for fen in record.fens]
     scores = []
@@ -54,9 +64,23 @@ def find_surprises(record: GameRecord, cfg: StudyConfig) -> list[int]:
         if z_white is not None:
             z_t = z_white if mover_white[t] else -z_white
             outcome = abs(v[t] - z_t)
-        scores.append(swing + 0.5 * outcome)
+        # Q-head predicted qhp[t] for the played move; it actually led to a
+        # position worth -v[t+1] to the mover. The gap is the Q-surprise.
+        q_surprise = 0.0
+        if qhp is not None and t + 1 < len(v):
+            q_surprise = abs(qhp[t] + v[t + 1])
+        scores.append(swing + 0.5 * outcome + cfg.q_surprise_weight * q_surprise)
     order = sorted(range(len(v)), key=lambda t: -scores[t])
     return [t for t in order[: cfg.top_k] if scores[t] >= cfg.min_surprise]
+
+
+def _top_line_indices(res, n: int) -> list[int]:
+    """The n moves the deep search rated highest (by empirical search Q) —
+    the alternate lines worth playing out from a surprise position."""
+    if n <= 0 or len(res.q_indices) == 0:
+        return []
+    order = np.argsort(-res.q_values)[:n]
+    return [int(res.q_indices[j]) for j in order]
 
 
 def _sample_from_search(board, res, value_target, weight) -> Sample:
@@ -110,15 +134,26 @@ def study_game_gen(
 ):
     if not record.fens:
         return []
-    deep_cfg = SearchConfig(sims=cfg.deep_sims, root_candidates=cfg.deep_candidates)
+    deep_cfg = SearchConfig(
+        sims=cfg.deep_sims,
+        root_candidates=cfg.deep_candidates,
+        q_trust=scfg.q_trust,
+    )
     out = []
     for t in find_surprises(record, cfg):
         board = chess.Board(record.fens[t])
         res = yield from run_search_gen(board, deep_cfg, rng)
         out.append(_sample_from_search(board, res, res.root_value, cfg.study_weight))
-        if res.move_index != record.samples[t].played_index:
-            board.push(res.move)
+        # multi-line reflection: play out each of the deep search's top moves
+        # as its own branch, so a surprising position teaches a whole tree of
+        # lines (the move played, plus the alternates the deep search preferred)
+        for mv_idx in _top_line_indices(res, cfg.n_lines):
+            mv = index_to_move(mv_idx, board, res.flipped)
+            if not board.is_legal(mv):
+                continue
+            board.push(mv)
             out.extend((yield from _play_branch_gen(board, scfg, cfg, rng)))
+            board.pop()
     return out
 
 

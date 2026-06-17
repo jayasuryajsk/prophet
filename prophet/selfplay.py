@@ -56,6 +56,7 @@ class GameRecord:
     plies: int
     fens: list | None = None  # position before each ply, aligned with samples
     root_values: list | None = None  # search root value per ply
+    q_head_played: list | None = None  # Q-head value for the played move per ply
 
 
 def play_game_gen(
@@ -137,6 +138,7 @@ def play_game_gen(
         plies=len(raw),
         fens=fens,
         root_values=[res.root_value for _, res, _, _ in raw],
+        q_head_played=[res.q_head_played for _, res, _, _ in raw],
     )
 
 

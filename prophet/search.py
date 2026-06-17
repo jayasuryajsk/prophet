@@ -38,6 +38,8 @@ class SearchConfig:
     c_puct: float = 1.5
     c_visit: float = 50.0
     c_scale: float = 1.0
+    q_trust: float = 1.0  # how much search trusts the Q-head for unvisited
+    # children (0 early when Q is noise, ramp to 1 as the Q-head matures)
 
 
 @dataclass
@@ -66,6 +68,8 @@ class SearchResult:
     q_indices: np.ndarray  # [K] visited children
     q_values: np.ndarray  # [K] empirical search Q (root perspective)
     q_visits: np.ndarray  # [K]
+    q_head_played: float = 0.0  # Q-head's raw value for the played move
+    # (compare to -V(child) to detect where intuition was surprised)
 
 
 def _evaluate_gen(board):
@@ -122,7 +126,7 @@ def _simulate_gen(board: chess.Board, node: Node, cfg: SearchConfig):
     sqrt_n = math.sqrt(node.visits)
     best_i, best_score = -1, -math.inf
     for i, child in node.children.items():
-        q = -child.mean if child.visits else child.q_init
+        q = -child.mean if child.visits else cfg.q_trust * child.q_init
         score = q + cfg.c_puct * child.prior * sqrt_n / (1 + child.visits)
         if score > best_score:
             best_i, best_score = i, score
@@ -160,7 +164,7 @@ def run_search_gen(board: chess.Board, cfg: SearchConfig, rng: np.random.Generat
 
     def completed_q(i: int) -> float:
         child = root.children[i]
-        return -child.mean if child.visits else child.q_init
+        return -child.mean if child.visits else cfg.q_trust * child.q_init
 
     def sigma(q: float) -> float:
         max_visits = max((c.visits for c in root.children.values()), default=0)
@@ -219,6 +223,7 @@ def run_search_gen(board: chess.Board, cfg: SearchConfig, rng: np.random.Generat
         q_indices=np.array([i for i, _ in visited], dtype=np.int64),
         q_values=np.array([-c.mean for _, c in visited], dtype=np.float32),
         q_visits=np.array([c.visits for _, c in visited], dtype=np.float32),
+        q_head_played=float(qs.get(best, 0.0)),
     )
 
 

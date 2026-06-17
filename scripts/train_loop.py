@@ -21,7 +21,9 @@ import torch  # noqa: I001
 import argparse
 import copy
 import csv
+import json
 import multiprocessing as mp
+import os
 import time
 from collections import deque
 
@@ -37,6 +39,7 @@ from prophet.model import (
     save_checkpoint,
     widen_input,
 )
+from prophet.schedule import loss_weights_at
 from prophet.search import SearchConfig
 from prophet.train import collate, train_step
 from prophet.worker import vector_worker
@@ -88,6 +91,7 @@ def main():
     ap.add_argument("--contempt", type=float, default=0.15)
     ap.add_argument("--win-discount", type=float, default=0.997)
     ap.add_argument("--ema", type=float, default=0.999, help="weight EMA decay; checkpoints/evals use the EMA")
+    ap.add_argument("--schedule", action="store_true", help="game-count curricula for study/q-trust/q-loss (moonshot)")
     args = ap.parse_args()
 
     out = Path(args.out)
@@ -95,7 +99,15 @@ def main():
     ckpt_path = out / "latest.pt"
     gate_path = out / "gate_on"
     gate_path.unlink(missing_ok=True)
+    progress_path = out / "progress.json"
     metrics_path = out / "metrics.csv"
+
+    def write_progress(games):
+        tmp = progress_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"games": games}))
+        os.replace(tmp, progress_path)
+
+    write_progress(0)
 
     device = torch.device(args.device)
     torch.manual_seed(0)
@@ -149,6 +161,7 @@ def main():
                 i, str(ckpt_path), str(gate_path), game_q, stop,
                 search_kwargs, selfplay_kwargs, study_kwargs, model_kwargs,
                 args.batch_games, args.worker_threads, args.worker_device,
+                str(progress_path) if args.schedule else None,
             ),
             daemon=True,
         )
@@ -199,11 +212,12 @@ def main():
                 gated = True
                 print(f"  GATE OPEN @{games_done}: study/resignation enabled", flush=True)
 
+            weights = loss_weights_at(games_done) if args.schedule else None
             if len(buffer) >= args.warmup:
                 steps = max(1, round(len(game.samples) * args.train_ratio / args.batch))
                 for _ in range(steps):
                     batch = collate(buffer.sample(args.batch, rng), device)
-                    losses = train_step(model, opt, batch)
+                    losses = train_step(model, opt, batch, weights=weights)
                     total_steps += 1
                     for k, v in losses.items():
                         ema[k] = v if k not in ema else 0.99 * ema[k] + 0.01 * v
@@ -215,6 +229,7 @@ def main():
 
             if games_done % args.sync_every == 0:
                 save_checkpoint(ema_model, ckpt_path)
+                write_progress(games_done)
 
             if games_done % args.log_every == 0:
                 gpm = games_done / max(1e-9, (time.time() - t0) / 60)
