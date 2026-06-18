@@ -94,6 +94,7 @@ def main():
     ap.add_argument("--ema", type=float, default=0.999, help="weight EMA decay; checkpoints/evals use the EMA")
     ap.add_argument("--schedule", action="store_true", help="game-count curricula for study/q-trust/q-loss (moonshot)")
     ap.add_argument("--compile", action="store_true", help="torch.compile worker inference (CUDA only)")
+    ap.add_argument("--no-eval", action="store_true", help="skip in-loop vs-random eval (still saves milestone checkpoints); use the gauntlet instead")
     args = ap.parse_args()
 
     out = Path(args.out)
@@ -257,30 +258,44 @@ def main():
             if games_done % args.eval_every == 0 or games_done == args.games:
                 save_checkpoint(ema_model, ckpt_path)
                 save_checkpoint(ema_model, out / f"ckpt_{games_done:06d}.pt")
-                ev = run_eval(
-                    ema_model, search_cfg, rng,
-                    args.eval_greedy_games, args.eval_search_games,
-                )
-                qw, qd, ql, _ = ev["q"]
-                pw, pd, pl, _ = ev["policy"]
-                sw, sd, sl, st = ev["search"]
-                print(
-                    f"  EVAL @{games_done}: q-greedy {qw}-{qd}-{ql} | "
-                    f"policy-greedy {pw}-{pd}-{pl} | search {sw}-{sd}-{sl} "
-                    f"(eval {st:.0f}s)",
-                    flush=True,
-                )
-                gpm = games_done / max(1e-9, (time.time() - t0) / 60)
-                mw.writerow(
-                    [
-                        games_done, total_steps, len(buffer),
-                        round(float(np.mean(recent_plies)), 1),
-                        round(float(np.mean(recent_decisive)), 3),
-                    ]
-                    + [round(ema.get(k, 0.0), 4) for k in ("loss", "policy", "value", "q", "consistency")]
-                    + [qw, qd, ql, pw, pd, pl, sw, sd, sl, round(gpm, 2)]
-                )
-                mf.flush()
+                if args.no_eval:
+                    # in-loop vs-random eval stalls the run (single-core eval
+                    # starved by the workers) and is uninformative; use the
+                    # cores-free gauntlet on the saved checkpoints instead
+                    mw.writerow(
+                        [games_done, total_steps, len(buffer),
+                         round(float(np.mean(recent_plies)), 1),
+                         round(float(np.mean(recent_decisive)), 3)]
+                        + [round(ema.get(k, 0.0), 4) for k in ("loss", "policy", "value", "q", "consistency")]
+                        + [0, 0, 0, 0, 0, 0, 0, 0, 0, round(games_done / max(1e-9, (time.time() - t0) / 60), 2)]
+                    )
+                    mf.flush()
+                    print(f"  CKPT @{games_done} (no in-loop eval)", flush=True)
+                else:
+                    ev = run_eval(
+                        ema_model, search_cfg, rng,
+                        args.eval_greedy_games, args.eval_search_games,
+                    )
+                    qw, qd, ql, _ = ev["q"]
+                    pw, pd, pl, _ = ev["policy"]
+                    sw, sd, sl, st = ev["search"]
+                    print(
+                        f"  EVAL @{games_done}: q-greedy {qw}-{qd}-{ql} | "
+                        f"policy-greedy {pw}-{pd}-{pl} | search {sw}-{sd}-{sl} "
+                        f"(eval {st:.0f}s)",
+                        flush=True,
+                    )
+                    gpm = games_done / max(1e-9, (time.time() - t0) / 60)
+                    mw.writerow(
+                        [
+                            games_done, total_steps, len(buffer),
+                            round(float(np.mean(recent_plies)), 1),
+                            round(float(np.mean(recent_decisive)), 3),
+                        ]
+                        + [round(ema.get(k, 0.0), 4) for k in ("loss", "policy", "value", "q", "consistency")]
+                        + [qw, qd, ql, pw, pd, pl, sw, sd, sl, round(gpm, 2)]
+                    )
+                    mf.flush()
     finally:
         stop.set()
         # drain so workers blocked on put() can see the stop event

@@ -145,11 +145,14 @@ def study_game_gen(
         out.append(_sample_from_search(board, res, res.root_value, cfg.study_weight))
         # multi-line reflection: play out each of the deep search's top moves
         # as its own branch, so a surprising position teaches a whole tree of
-        # lines (the move played, plus the alternates the deep search preferred)
+        # lines (the move played, plus the alternates the deep search preferred).
+        # Each line gets a FRESH board from the surprise FEN — _play_branch_gen
+        # advances the board it's given and does not rewind it, so a shared
+        # board would leave stale state for the next line (illegal-action crash).
         for mv_idx in _top_line_indices(res, cfg.n_lines):
-            board.push_action(int(mv_idx))
-            out.extend((yield from _play_branch_gen(board, scfg, cfg, rng)))
-            board.pop()
+            branch_board = board_from_fen(record.fens[t])
+            branch_board.push_action(int(mv_idx))
+            out.extend((yield from _play_branch_gen(branch_board, scfg, cfg, rng)))
     return out
 
 

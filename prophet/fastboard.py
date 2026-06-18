@@ -85,7 +85,10 @@ class PyChessBoard:
         return index_to_move(int(a), self.board, flipped)
 
     def push_action(self, a):
-        self.board.push(self.move_for(a))
+        mv = self.move_for(a)
+        if not self.board.is_legal(mv):  # match the Rust board's strictness
+            raise ValueError(f"illegal action {a}")
+        self.board.push(mv)
 
     def pop(self):
         self.board.pop()
