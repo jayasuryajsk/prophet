@@ -13,7 +13,7 @@ import chess
 import numpy as np
 
 from .encoding import encode_board, legal_move_map
-from .search import SearchConfig, _terminal_value, run_search
+from .search import SearchConfig, _terminal_value, search_move
 
 
 PIECE_VALUE = {
@@ -81,7 +81,7 @@ def play_vs_random(
         while _terminal_value(board) is None and plies < max_plies:
             if board.turn == (chess.WHITE if model_is_white else chess.BLACK):
                 if mode == "search":
-                    mv = run_search(model, board, search_cfg, device, rng).move
+                    mv = search_move(model, board, search_cfg, device, rng)
                 else:
                     mv = greedy_move(model, board, device, mode)
             elif opponent == "material":

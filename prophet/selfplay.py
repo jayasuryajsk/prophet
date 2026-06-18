@@ -16,11 +16,10 @@ ignores resignation so miscalibration would show up as losses there.
 
 from dataclasses import dataclass
 
-import chess
 import numpy as np
 
-from .encoding import encode_board
-from .search import SearchConfig, _terminal_value, drive, run_search_gen
+from .fastboard import new_board
+from .search import SearchConfig, drive, run_search_gen
 
 
 @dataclass
@@ -63,44 +62,44 @@ def play_game_gen(
     search_cfg: SearchConfig,
     cfg: SelfPlayConfig,
     rng: np.random.Generator,
-    board: chess.Board | None = None,
+    board=None,
     resign_enabled: bool = False,
 ):
-    board = board or chess.Board()
+    board = board or new_board()
     raw = []  # (x, search result, child features, mover_was_white)
     fens = []
     resign_active = resign_enabled and rng.random() >= cfg.resign_off_prob
-    low_streak = {chess.WHITE: 0, chess.BLACK: 0}
+    low_streak = {True: 0, False: 0}  # keyed by mover_was_white
     resigned_winner_white = None
 
-    while _terminal_value(board) is None and len(raw) < cfg.max_plies:
-        mover = board.turn
+    while board.terminal_value() is None and len(raw) < cfg.max_plies:
+        mover_white = board.turn
         fens.append(board.fen())
-        x, _ = encode_board(board)
+        x = board.encode()
         res = yield from run_search_gen(board, search_cfg, rng)
-        board.push(res.move)
-        child_x, _ = encode_board(board)
-        raw.append((x, res, child_x, mover == chess.WHITE))
+        board.push_action(res.move_index)
+        child_x = board.encode()
+        raw.append((x, res, child_x, mover_white))
 
         if res.root_value < cfg.resign_threshold:
-            low_streak[mover] += 1
+            low_streak[mover_white] += 1
         else:
-            low_streak[mover] = 0
-        if resign_active and low_streak[mover] >= cfg.resign_plies:
-            resigned_winner_white = mover == chess.BLACK
+            low_streak[mover_white] = 0
+        if resign_active and low_streak[mover_white] >= cfg.resign_plies:
+            resigned_winner_white = not mover_white  # mover resigns; opponent wins
             break
 
     if resigned_winner_white is not None:
         result = "1-0" if resigned_winner_white else "0-1"
         z_white = 1.0 if resigned_winner_white else -1.0
     else:
-        term = _terminal_value(board)
+        term = board.terminal_value()
         if term is None:
             result = "*"
             z_white = None
-        elif board.is_checkmate():
-            result = "0-1" if board.turn == chess.WHITE else "1-0"
-            z_white = -1.0 if board.turn == chess.WHITE else 1.0
+        elif term == -1.0:  # side to move is checkmated
+            result = "0-1" if board.turn else "1-0"
+            z_white = -1.0 if board.turn else 1.0
         else:
             result = "1/2-1/2"
             z_white = 0.0
@@ -148,7 +147,7 @@ def play_game(
     cfg: SelfPlayConfig,
     device,
     rng: np.random.Generator,
-    board: chess.Board | None = None,
+    board=None,
     resign_enabled: bool = False,
 ) -> GameRecord:
     return drive(

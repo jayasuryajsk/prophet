@@ -30,6 +30,7 @@ import chess
 import chess.engine
 import numpy as np
 
+from prophet.fastboard import PyChessBoard
 from prophet.model import load_checkpoint
 from prophet.search import SearchConfig, _terminal_value, run_search_gen
 
@@ -54,11 +55,12 @@ def _game_gen(game_idx, seed):
     rng = np.random.default_rng(seed)
     model_is_white = game_idx % 2 == 0
     board = chess.Board()
+    pb = PyChessBoard(board)
     plies = 0
     while _terminal_value(board) is None and plies < MAX_PLIES:
         if board.turn == (chess.WHITE if model_is_white else chess.BLACK):
-            res = yield from run_search_gen(board, _worker["scfg"], rng)
-            board.push(res.move)
+            res = yield from run_search_gen(pb, _worker["scfg"], rng)
+            board.push(pb.move_for(res.move_index))
         else:
             board.push(_worker["engine"].play(board, _worker["limit"]).move)
         plies += 1

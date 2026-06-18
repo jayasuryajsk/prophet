@@ -17,7 +17,7 @@ import chess.engine
 import numpy as np
 
 from prophet.model import load_checkpoint
-from prophet.search import SearchConfig, _terminal_value, run_search
+from prophet.search import SearchConfig, _terminal_value, search_move
 
 VALS = {chess.PAWN: 1, chess.KNIGHT: 3, chess.BISHOP: 3, chess.ROOK: 5, chess.QUEEN: 9}
 
@@ -32,7 +32,7 @@ def play(model, scfg, rng, opponent=None, model_is_white=True, max_plies=300):
     while _terminal_value(board) is None and len(sans) < max_plies:
         model_turn = board.turn == (chess.WHITE if model_is_white else chess.BLACK)
         if model_turn or opponent is None:
-            mv = run_search(model, board, scfg, torch.device("cpu"), rng).move
+            mv = search_move(model, board, scfg, torch.device("cpu"), rng)
         else:
             mv = opponent.play(board, chess.engine.Limit(time=0.05)).move
         sans.append(board.san(mv))

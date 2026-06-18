@@ -22,7 +22,8 @@ from prophet.encoding import (
     move_to_index,
 )
 from prophet.model import ModelConfig, PolicyQValueNet
-from prophet.search import SearchConfig, run_search
+from prophet.fastboard import PyChessBoard
+from prophet.search import SearchConfig, run_search, search_move
 from prophet.selfplay import SelfPlayConfig, play_game
 from prophet.train import collate, train_step
 
@@ -90,14 +91,15 @@ def test_search(model, device, rng):
     ]:
         board = chess.Board(fen)
         t0 = time.perf_counter()
-        res = run_search(model, board, cfg, device, rng)
+        mv = search_move(model, board, cfg, device, rng)
+        res = run_search(model, PyChessBoard(board), cfg, device, rng)
         dt = time.perf_counter() - t0
-        check(board.is_legal(res.move), f"illegal move {res.move} from {fen}")
+        check(board.is_legal(mv), f"illegal move {mv} from {fen}")
         check(abs(res.policy_target.sum() - 1.0) < 1e-4, "policy target sums to 1")
         check(-1.0 <= res.root_value <= 1.0, "root value range")
         check(len(res.q_indices) > 0, "search produced q targets")
         check(bool((res.q_visits > 0).all()), "q targets have visits")
-        print(f"  {fen.split()[0][:20]:22s} -> {res.move.uci()}  ({dt*1000:.0f} ms)")
+        print(f"  {fen.split()[0][:20]:22s} -> {mv.uci()}  ({dt*1000:.0f} ms)")
     print(PASS)
 
 

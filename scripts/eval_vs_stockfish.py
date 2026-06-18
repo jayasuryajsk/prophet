@@ -29,7 +29,7 @@ import chess.engine
 import numpy as np
 
 from prophet.model import load_checkpoint
-from prophet.search import SearchConfig, _terminal_value, run_search
+from prophet.search import SearchConfig, _terminal_value, search_move
 
 CONFIGS = {
     "skill0d1": {
@@ -60,7 +60,7 @@ def play_match(model, engine, sf_limit, n_games, scfg, rng, max_plies=300):
         plies = 0
         while _terminal_value(board) is None and plies < max_plies:
             if board.turn == (chess.WHITE if model_is_white else chess.BLACK):
-                mv = run_search(model, board, scfg, torch.device("cpu"), rng).move
+                mv = search_move(model, board, scfg, torch.device("cpu"), rng)
             else:
                 mv = engine.play(board, sf_limit).move
             board.push(mv)

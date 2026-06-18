@@ -22,11 +22,10 @@ synchronous wrapper.
 
 from dataclasses import dataclass
 
-import chess
 import numpy as np
 
-from .encoding import encode_board, index_to_move
-from .search import SearchConfig, _terminal_value, drive, run_search_gen
+from .fastboard import board_from_fen
+from .search import SearchConfig, drive, run_search_gen
 from .selfplay import GameRecord, Sample
 
 
@@ -84,9 +83,9 @@ def _top_line_indices(res, n: int) -> list[int]:
 
 
 def _sample_from_search(board, res, value_target, weight) -> Sample:
-    x, _ = encode_board(board)
-    board.push(res.move)
-    child_x, _ = encode_board(board)
+    x = board.encode()
+    board.push_action(res.move_index)
+    child_x = board.encode()
     board.pop()
     return Sample(
         x=x,
@@ -105,19 +104,19 @@ def _sample_from_search(board, res, value_target, weight) -> Sample:
 def _play_branch_gen(board, scfg, cfg, rng):
     """Continue self-play from a counterfactual position for a few plies."""
     raw = []  # (sample, mover_was_white)
-    while _terminal_value(board) is None and len(raw) < cfg.branch_plies:
+    while board.terminal_value() is None and len(raw) < cfg.branch_plies:
         res = yield from run_search_gen(board, scfg, rng)
         raw.append(
             (
                 _sample_from_search(board, res, res.root_value, cfg.branch_weight),
-                board.turn == chess.WHITE,
+                board.turn,
             )
         )
-        board.push(res.move)
-    term = _terminal_value(board)
+        board.push_action(res.move_index)
+    term = board.terminal_value()
     if term is not None:
-        if board.is_checkmate():
-            z_white = -1.0 if board.turn == chess.WHITE else 1.0
+        if term == -1.0:  # side to move is checkmated
+            z_white = -1.0 if board.turn else 1.0
         else:
             z_white = 0.0
         for s, mover_was_white in raw:
@@ -141,17 +140,14 @@ def study_game_gen(
     )
     out = []
     for t in find_surprises(record, cfg):
-        board = chess.Board(record.fens[t])
+        board = board_from_fen(record.fens[t])
         res = yield from run_search_gen(board, deep_cfg, rng)
         out.append(_sample_from_search(board, res, res.root_value, cfg.study_weight))
         # multi-line reflection: play out each of the deep search's top moves
         # as its own branch, so a surprising position teaches a whole tree of
         # lines (the move played, plus the alternates the deep search preferred)
         for mv_idx in _top_line_indices(res, cfg.n_lines):
-            mv = index_to_move(mv_idx, board, res.flipped)
-            if not board.is_legal(mv):
-                continue
-            board.push(mv)
+            board.push_action(int(mv_idx))
             out.extend((yield from _play_branch_gen(board, scfg, cfg, rng)))
             board.pop()
     return out

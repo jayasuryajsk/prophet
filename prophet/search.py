@@ -50,7 +50,6 @@ class Node:
     total: float = 0.0  # sum of values from THIS node's perspective
     expanded: bool = False
     children: dict = field(default_factory=dict)  # action index -> Node
-    moves: dict = field(default_factory=dict)  # action index -> chess.Move
 
     @property
     def mean(self) -> float:
@@ -59,11 +58,9 @@ class Node:
 
 @dataclass
 class SearchResult:
-    move: chess.Move
-    move_index: int
+    move_index: int  # chosen action (from*64 + to, side-to-move flipped)
     root_value: float
-    flipped: bool
-    legal_indices: np.ndarray  # [L]
+    legal_indices: np.ndarray  # [L] action indices
     policy_target: np.ndarray  # [L], sums to 1, aligned with legal_indices
     q_indices: np.ndarray  # [K] visited children
     q_values: np.ndarray  # [K] empirical search Q (root perspective)
@@ -74,22 +71,22 @@ class SearchResult:
 
 def _evaluate_gen(board):
     """Generator: yields features, receives (logits, q, v); returns
-    (legal map, priors, q-by-index, v, raw logits, flipped)."""
-    x, flipped = encode_board(board)
+    (legal action indices, priors, q-by-index, v, raw logits). `board` is any
+    object implementing the fastboard protocol (encode / legal_actions / ...)."""
+    x = board.encode()
     logits, q, v = yield x
-    legal = legal_move_map(board, flipped)
-    idx = np.fromiter(legal.keys(), dtype=np.int64)
+    idx = np.asarray(board.legal_actions(), dtype=np.int64)
     lg = logits[idx]
     lg = lg - lg.max()
     p = np.exp(lg)
     p /= p.sum()
     priors = dict(zip(idx.tolist(), p.tolist()))
     qs = {i: float(q[i]) for i in idx.tolist()}
-    return legal, priors, qs, float(v), logits, flipped
+    return idx, priors, qs, float(v), logits
 
 
 def _terminal_value(board: chess.Board) -> float | None:
-    """Value for the side to move, or None if not terminal."""
+    """Value for the side to move, or None if not terminal (python-chess)."""
     if board.is_checkmate():
         return -1.0
     if (
@@ -102,18 +99,17 @@ def _terminal_value(board: chess.Board) -> float | None:
     return None
 
 
-def _expand_gen(node: Node, board: chess.Board):
-    legal, priors, qs, v, _, _ = yield from _evaluate_gen(board)
-    for i, mv in legal.items():
+def _expand_gen(node: Node, board):
+    idx, priors, qs, v, _ = yield from _evaluate_gen(board)
+    for i in idx.tolist():
         node.children[i] = Node(prior=priors[i], q_init=qs[i])
-        node.moves[i] = mv
     node.expanded = True
     return v
 
 
-def _simulate_gen(board: chess.Board, node: Node, cfg: SearchConfig):
+def _simulate_gen(board, node: Node, cfg: SearchConfig):
     """One playout; returns value from this node's side-to-move perspective."""
-    term = _terminal_value(board)
+    term = board.terminal_value()
     if term is not None:
         node.visits += 1
         node.total += term
@@ -131,7 +127,7 @@ def _simulate_gen(board: chess.Board, node: Node, cfg: SearchConfig):
         if score > best_score:
             best_i, best_score = i, score
     child = node.children[best_i]
-    board.push(node.moves[best_i])
+    board.push_action(best_i)
     v = -(yield from _simulate_gen(board, child, cfg))
     board.pop()
     node.visits += 1
@@ -139,17 +135,16 @@ def _simulate_gen(board: chess.Board, node: Node, cfg: SearchConfig):
     return v
 
 
-def run_search_gen(board: chess.Board, cfg: SearchConfig, rng: np.random.Generator):
-    """Generator form of the full search; returns a SearchResult."""
-    legal, priors, qs, v_root, logits, flipped = yield from _evaluate_gen(board)
-    if not legal:
+def run_search_gen(board, cfg: SearchConfig, rng: np.random.Generator):
+    """Generator form of the full search; returns a SearchResult. `board` is
+    any object implementing the fastboard protocol."""
+    idx, priors, qs, v_root, logits = yield from _evaluate_gen(board)
+    if len(idx) == 0:
         raise ValueError(f"no legal moves to search: {board.fen()}")
-    idx = np.fromiter(legal.keys(), dtype=np.int64)
 
     root = Node()
-    for i, mv in legal.items():
+    for i in idx.tolist():
         root.children[i] = Node(prior=priors[i], q_init=qs[i])
-        root.moves[i] = mv
     root.expanded = True
     root.visits = 1
     root.total = v_root
@@ -181,7 +176,7 @@ def run_search_gen(board: chess.Board, cfg: SearchConfig, rng: np.random.Generat
                 if sims_used >= cfg.sims:
                     break
                 child = root.children[i]
-                board.push(root.moves[i])
+                board.push_action(i)
                 val = -(yield from _simulate_gen(board, child, cfg))
                 board.pop()
                 root.visits += 1
@@ -214,10 +209,8 @@ def run_search_gen(board: chess.Board, cfg: SearchConfig, rng: np.random.Generat
 
     visited = [(i, c) for i, c in root.children.items() if c.visits]
     return SearchResult(
-        move=root.moves[best],
         move_index=best,
         root_value=float(root_value),
-        flipped=flipped,
         legal_indices=idx,
         policy_target=pi.astype(np.float32),
         q_indices=np.array([i for i, _ in visited], dtype=np.int64),
@@ -248,7 +241,15 @@ def drive(gen, model, device):
         return e.value
 
 
-def run_search(
-    model, board: chess.Board, cfg: SearchConfig, device, rng: np.random.Generator
-) -> SearchResult:
+def run_search(model, board, cfg: SearchConfig, device, rng: np.random.Generator) -> SearchResult:
     return drive(run_search_gen(board, cfg, rng), model, device)
+
+
+def search_move(model, chess_board, cfg: SearchConfig, device, rng) -> chess.Move:
+    """Run search on a python-chess board and return the chosen chess.Move
+    (for eval / Stockfish interop). Leaves the board unchanged."""
+    from .fastboard import PyChessBoard
+
+    pb = PyChessBoard(chess_board)
+    res = run_search(model, pb, cfg, device, rng)
+    return pb.move_for(res.move_index)
