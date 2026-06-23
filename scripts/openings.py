@@ -21,7 +21,7 @@ import numpy as np
 
 from prophet.encoding import encode_board, legal_move_map
 from prophet.model import load_checkpoint
-from prophet.search import SearchConfig, _terminal_value, run_search
+from prophet.search import SearchConfig, _terminal_value, search_move
 
 
 @torch.no_grad()
@@ -74,9 +74,9 @@ def main():
         board = chess.Board()
         sans = []
         while _terminal_value(board) is None and len(sans) < args.plies:
-            res = run_search(model, board, scfg, torch.device("cpu"), rng)
-            sans.append(board.san(res.move))
-            board.push(res.move)
+            mv = search_move(model, board, scfg, torch.device("cpu"), rng)
+            sans.append(board.san(mv))
+            board.push(mv)
         lines.append(sans)
 
     for depth, label in [(1, "first move"), (2, "first 2 plies"), (6, "first 6 plies")]:

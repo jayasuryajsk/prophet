@@ -88,11 +88,13 @@ def main():
     ap.add_argument("--deep-sims", type=int, default=128)
     ap.add_argument("--branch-plies", type=int, default=16)
     ap.add_argument("--study-weight", type=float, default=2.0)
+    ap.add_argument("--n-lines", type=int, default=1, help="alternate lines explored per surprise position (multi-line reflection)")
     ap.add_argument("--init-from", default=None, help="warm-start checkpoint (upgraded in place)")
     ap.add_argument("--contempt", type=float, default=0.15)
     ap.add_argument("--win-discount", type=float, default=0.997)
     ap.add_argument("--ema", type=float, default=0.999, help="weight EMA decay; checkpoints/evals use the EMA")
     ap.add_argument("--schedule", action="store_true", help="game-count curricula for study/q-trust/q-loss (moonshot)")
+    ap.add_argument("--start-game", type=int, default=0, help="resume schedule/gate/counter at this game # (warm restart after a crash)")
     ap.add_argument("--compile", action="store_true", help="torch.compile worker inference (CUDA only)")
     ap.add_argument("--no-eval", action="store_true", help="skip in-loop vs-random eval (still saves milestone checkpoints); use the gauntlet instead")
     args = ap.parse_args()
@@ -101,7 +103,10 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     ckpt_path = out / "latest.pt"
     gate_path = out / "gate_on"
-    gate_path.unlink(missing_ok=True)
+    if args.start_game >= args.gate:
+        gate_path.touch()  # warm restart past the gate -> study on from game 1
+    else:
+        gate_path.unlink(missing_ok=True)
     progress_path = out / "progress.json"
     metrics_path = out / "metrics.csv"
 
@@ -110,7 +115,7 @@ def main():
         tmp.write_text(json.dumps({"games": games}))
         os.replace(tmp, progress_path)
 
-    write_progress(0)
+    write_progress(args.start_game)  # workers read the resumed game # -> correct schedule band
 
     setup_perf(args.device)
     device = torch.device(args.device)
@@ -152,6 +157,7 @@ def main():
             "deep_sims": args.deep_sims,
             "branch_plies": args.branch_plies,
             "study_weight": args.study_weight,
+            "n_lines": args.n_lines,
         }
         if args.study
         else None
@@ -188,9 +194,9 @@ def main():
     ema = {}
     recent_plies = deque(maxlen=200)
     recent_decisive = deque(maxlen=200)
-    games_done = 0
+    games_done = args.start_game
     total_steps = 0
-    gated = False
+    gated = args.start_game >= args.gate
     t0 = time.time()
 
     new_metrics = not metrics_path.exists()

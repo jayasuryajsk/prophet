@@ -39,12 +39,18 @@ MAX_PLIES = 400
 _worker = {}
 
 
-def _init_worker(ckpt, forwards, candidates, sf_movetime, threads):
+def _init_worker(ckpt, forwards, candidates, sf_movetime, threads, sf_nodes=0):
     torch.set_num_threads(threads)
     _worker["model"] = load_checkpoint(_worker.get("ckpt", ckpt))
     # eval-compute cap: root eval + sims, one forward each -> sims = cap - 1
     _worker["scfg"] = SearchConfig(sims=forwards - 1, root_candidates=candidates)
-    _worker["limit"] = chess.engine.Limit(time=sf_movetime)
+    # nodes-limit is contention-immune (fixed search regardless of CPU load);
+    # use it to benchmark alongside training. time-limit sags when cores are busy.
+    _worker["limit"] = (
+        chess.engine.Limit(nodes=sf_nodes)
+        if sf_nodes
+        else chess.engine.Limit(time=sf_movetime)
+    )
     _worker["engine"] = chess.engine.SimpleEngine.popen_uci("stockfish")
 
 
@@ -93,7 +99,8 @@ def _play_chunk(chunk):
                 pending[i] = gens[i].send((logits[j], q[j], v[j]))
                 still.append(i)
             except StopIteration as e:
-                scores.append((rung, e.value))
+                # tag with model's color (game_idx even -> model is white)
+                scores.append((rung, e.value, games[i][0] % 2 == 0))
         active = still
     return scores
 
@@ -130,6 +137,8 @@ def main():
     ap.add_argument("--forwards", type=int, default=256, help="eval-compute cap per move")
     ap.add_argument("--candidates", type=int, default=16)
     ap.add_argument("--sf-movetime", type=float, default=0.1)
+    ap.add_argument("--sf-nodes", type=int, default=0,
+                    help="fixed Stockfish nodes/move (contention-immune); overrides movetime")
     ap.add_argument("--procs", type=int, default=6)
     ap.add_argument("--threads", type=int, default=2)
     ap.add_argument("--concurrent", type=int, default=10, help="games batched per worker")
@@ -161,7 +170,8 @@ def main():
     with ctx.Pool(
         args.procs,
         initializer=_init_worker,
-        initargs=(args.ckpt, args.forwards, args.candidates, args.sf_movetime, args.threads),
+        initargs=(args.ckpt, args.forwards, args.candidates, args.sf_movetime,
+                  args.threads, args.sf_nodes),
     ) as pool:
         done = 0
         for chunk_scores in pool.imap_unordered(_play_chunk, chunks):
@@ -169,23 +179,38 @@ def main():
             done += len(chunk_scores)
             print(f"  {done}/{n_games} games ({time.perf_counter()-t0:.0f}s)", flush=True)
 
-    per_rung = {}
-    for rung, score in results:
-        w, d, l = per_rung.get(rung, (0, 0, 0))
-        per_rung[rung] = (
-            w + (score == 1.0),
-            d + (score == 0.5),
-            l + (score == 0.0),
-        )
+    def tally(rows):
+        per = {}
+        for rung, score in rows:
+            w, d, l = per.get(rung, (0, 0, 0))
+            per[rung] = (w + (score == 1.0), d + (score == 0.5), l + (score == 0.0))
+        return per
+
+    # results are (rung, score, model_is_white); split by color
+    all_games = [(r, s) for r, s, _ in results]
+    white = [(r, s) for r, s, wt in results if wt]
+    black = [(r, s) for r, s, wt in results if not wt]
+    per_rung = tally(all_games)
+
     print(f"\n== results ({time.perf_counter()-t0:.0f}s) ==")
     for rung in rungs:
         w, d, l = per_rung[rung]
         n = w + d + l
         print(f"  vs {rung}: {w}-{d}-{l}  score {(w + 0.5*d)/n:.1%}")
 
-    elo, bound = mle_elo(results)
+    elo, bound = mle_elo(all_games)
     tag = "<=" if bound and elo < rungs[0] else (">=" if bound else "")
     print(f"\n  benchmark Elo: {tag} {elo:.0f}")
+
+    # color split: is the model carried by its White play?
+    welo, belo = None, None
+    if white and black:
+        welo, _ = mle_elo(white)
+        belo, _ = mle_elo(black)
+        ws = sum(s for _, s in white) / len(white)
+        bs = sum(s for _, s in black) / len(black)
+        print(f"  as White: Elo {welo:.0f}  ({ws:.1%} over {len(white)} games)")
+        print(f"  as Black: Elo {belo:.0f}  ({bs:.1%} over {len(black)} games)")
 
     if args.out:
         Path(args.out).write_text(
@@ -194,6 +219,8 @@ def main():
                     "ckpt": args.ckpt,
                     "rungs": {str(r): per_rung[r] for r in rungs},
                     "elo": round(elo, 1),
+                    "elo_white": round(welo, 1) if welo is not None else None,
+                    "elo_black": round(belo, 1) if belo is not None else None,
                     "bound": bound,
                     "forwards_cap": args.forwards,
                     "games_per_rung": args.games_per_rung,
