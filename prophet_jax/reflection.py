@@ -71,6 +71,7 @@ from .env import (
     encode_state,
     env_step,
     legal_mask,
+    mover_white,
     terminal_info,
 )
 from .search import batched_search
@@ -463,17 +464,11 @@ def _play_branch(params, key, start_state, scfg: SearchConfig, branch_plies: int
 def _mover_is_white(state):
     """Whether the side to move at ``state`` is White (player 0), per element.
 
-    In pgx chess the first player to move from the standard start is White, and
-    ``state.current_player`` is the player-id (0/1) to move.  Self-play / meta
-    record ``mover_white`` consistently with player-id 0 == White; we mirror
-    that here.
+    Use the env bridge helper because pgx may randomize player-id order at
+    init; chess color lives in ``state._x.color``, not necessarily
+    ``state.current_player``.
     """
-    # VERIFY: pgx encodes the side-to-move color in observation plane 112
-    # (1.0 => one color) per the chess docs; current_player is a play-ORDER id,
-    # not necessarily the chess color when init randomizes the starting player.
-    # selfplay/env.py is the single source of truth for the white-mover flag, so
-    # if it derives white differently, route through that helper instead.
-    return state.current_player == 0
+    return mover_white(state)
 
 
 def _select_state(active, state_if_active, state_if_done):

@@ -71,6 +71,7 @@ from typing import Any, Tuple
 import jax
 import jax.numpy as jnp
 import pgx
+from pgx._src.games.chess import FROM_PLANE as _PGX_FROM_PLANE_TABLE
 
 # ---------------------------------------------------------------------------
 # Constants (kept local; config.py re-exports the canonical copies). These are
@@ -146,14 +147,14 @@ def _pgx_can_castle_king(state: "pgx.State"):
     """bool[..., 2] = (my, opp) king-side castling rights.
 
     pgx GameState exposes ``castling_rights`` bool[2, 2] = [player, side].
-    Last-axis side index 0 -> king-side, 1 -> queen-side. VERIFY side ordering.
+    Last-axis side index 0 -> queen-side, 1 -> king-side.
     """
-    return _gamestate(state).castling_rights[..., 0]
+    return _gamestate(state).castling_rights[..., 1]
 
 
 def _pgx_can_castle_queen(state: "pgx.State"):
     """bool[..., 2] = (my, opp) queen-side castling rights. See above."""
-    return _gamestate(state).castling_rights[..., 1]
+    return _gamestate(state).castling_rights[..., 0]
 
 
 def _pgx_en_passant(state: "pgx.State"):
@@ -210,11 +211,14 @@ def _pgx_halfmove(state: "pgx.State"):
 # pgx already rotates to the mover's POV. PIN WITH THE PARITY TEST.
 _PGX_NEEDS_EXTRA_FLIP = False  # VERIFY (flip parity)
 
-# Static pgx-square -> LERF-square permutation. Identity is the assumed-correct
-# value (pgx chess squares decode to LERF once you apply from=a//73). If the
-# parity test shows a horizontal/vertical/transpose mismatch, replace this
-# table (it is a plain length-64 int32 array, fully static / jit-friendly).
-_PGX_SQ_TO_LERF = jnp.arange(64, dtype=jnp.int32)  # VERIFY (identity assumed)
+# Static pgx-square -> LERF-square permutation. pgx chess numbers squares
+# file-major (a1=0, a2=1, ..., h8=63); python-chess/prophet use LERF
+# rank-major (a1=0, b1=1, ..., h8=63). Convert pgx square s=(file*8+rank) to
+# LERF square (rank*8+file). pgx already keeps the board mover-relative, so this
+# transpose is sufficient; no extra ^56 is applied.
+_PGX_SQ_TO_LERF = jnp.asarray(
+    [(s % 8) * 8 + (s // 8) for s in range(64)], dtype=jnp.int32
+)
 _LERF_TO_PGX_SQ = jnp.argsort(_PGX_SQ_TO_LERF).astype(jnp.int32)
 
 
@@ -231,72 +235,14 @@ def _pgx_sq_to_model(sq):  # pgx square (int array) -> prophet model square
 #  ACTION GEOMETRY:  pgx 4672 action  ->  (from_sq, to_sq) in pgx squares
 # ===========================================================================
 #
-# pgx action a = from_sq*73 + move_type, move_type in [0,73):
-#   move_type   0..55 : the 56 "queen-style" sliding rays
-#               56..63: the 8 knight moves
-#               64..72: the 9 underpromotions (3 directions x {N,B,R})
-#
-# We decode a -> (from_sq, to_sq) purely from move_type geometry, ONCE, at
-# module load, into a static int32[4672] -> to_sq table (and from_sq table).
-# Underpromotions (64..72) collapse onto the *same destination* as the queen
-# promotion (a forward / diag-capture push to the last rank), which is exactly
-# how prophet drops non-queen promos onto the single queen index. So the to_sq
-# for an underpromotion is the push/capture target square; the prophet index is
-# then identical to the queen promotion's index, and they OR together into one
-# legal bit. (We compute the geometric to_sq; the test confirms it.)
-#
-# The 56 queen rays are laid out as 8 directions x 7 distances. pgx/chess.py
-# orders the 8 directions; the 8 knight deltas and the 3 underpromo directions
-# also have a fixed order. Because the exact ordering is an internal pgx
-# constant we could not execute, the delta tables below are written in the most
-# likely-correct pgx order and marked VERIFY. They feed a single static lookup,
-# so a wrong order is a one-line fix surfaced loudly by the parity test (a
-# legal-mask mismatch).
-#
-# Coordinates here are LERF file/rank: file = sq % 8, rank = sq // 8, and a ray
-# step of (df, dr) moves to file+df, rank+dr. "Up the board" for the mover is
-# +rank (toward rank 7 / the 8th rank), matching pgx's mover-relative board.
+# pgx action a = from_sq*73 + move_type, move_type in [0,73). pgx's plane
+# layout is private and has changed before, so do not duplicate the geometry
+# here. Import pgx's own FROM_PLANE table and use it as the source of truth for
+# action -> destination. Underpromotions collapse onto the same prophet
+# from-to index as queen promotions; prophet_to_pgx prefers the normal
+# queen-promotion action when several pgx labels collide.
 
 import numpy as _np  # static table construction only (host-side, at import)
-
-# 8 queen/king directions, prophet/LERF (df, dr). Order assumed to match pgx's
-# (N, NE, E, SE, S, SW, W, NW). VERIFY against pgx/chess.py CAN_MOVE / ray gen.
-_QUEEN_DIRS = _np.array(
-    [
-        (0, 1),    # N   (up)
-        (1, 1),    # NE
-        (1, 0),    # E
-        (1, -1),   # SE
-        (0, -1),   # S   (down)
-        (-1, -1),  # SW
-        (-1, 0),   # W
-        (-1, 1),   # NW
-    ],
-    dtype=_np.int32,
-)
-
-# 8 knight deltas (df, dr). Order assumed to match pgx. VERIFY.
-_KNIGHT_DELTAS = _np.array(
-    [
-        (1, 2),
-        (2, 1),
-        (2, -1),
-        (1, -2),
-        (-1, -2),
-        (-2, -1),
-        (-2, 1),
-        (-1, 2),
-    ],
-    dtype=_np.int32,
-)
-
-# Underpromotion: 3 forward/diagonal directions (df) at dr=+1 (mover pushes up
-# to rank 7), x 3 promo pieces. pgx order assumed: direction outer (left-cap,
-# straight, right-cap) then piece (knight, bishop, rook) — 9 total. We only
-# need the destination square (df, +1), which is identical for all 3 pieces, so
-# piece order is irrelevant for the to-square. VERIFY direction set.
-_UNDERPROMO_DF = _np.array([-1, 0, 1], dtype=_np.int32)
-
 
 def _build_pgx_action_tables() -> Tuple[_np.ndarray, _np.ndarray, _np.ndarray]:
     """Build static int32[4672] tables: from_sq, to_sq, valid.
@@ -309,24 +255,14 @@ def _build_pgx_action_tables() -> Tuple[_np.ndarray, _np.ndarray, _np.ndarray]:
     to_sq = _np.zeros(PGX_NUM_ACTIONS, dtype=_np.int32)
     valid = _np.zeros(PGX_NUM_ACTIONS, dtype=_np.bool_)
 
+    pgx_to_sq = _np.asarray(_PGX_FROM_PLANE_TABLE, dtype=_np.int32)
     for s in range(64):
-        f0, r0 = s % 8, s // 8
         for mt in range(73):
             a = s * PGX_FROM_STRIDE + mt
+            to = int(pgx_to_sq[s, mt])
             from_sq[a] = s
-            if mt < 56:  # queen rays: 8 dirs x 7 distances
-                d = mt // 7
-                dist = (mt % 7) + 1
-                df, dr = _QUEEN_DIRS[d]
-                tf, tr = f0 + df * dist, r0 + dr * dist
-            elif mt < 64:  # knight
-                df, dr = _KNIGHT_DELTAS[mt - 56]
-                tf, tr = f0 + df, r0 + dr
-            else:  # underpromotion 64..72: 3 dirs x 3 pieces, dr=+1
-                df = _UNDERPROMO_DF[(mt - 64) // 3]
-                tf, tr = f0 + df, r0 + 1
-            if 0 <= tf < 8 and 0 <= tr < 8:
-                to_sq[a] = tr * 8 + tf
+            if 0 <= to < 64:
+                to_sq[a] = to
                 valid[a] = True
             else:
                 to_sq[a] = s  # off-board: undefined dest, kept in-range
@@ -536,24 +472,28 @@ def _prophet_maps_single(legal_action_mask: jax.Array) -> Tuple[jax.Array, jax.A
 
     # prophet_legal[4096]: OR of legality over all pgx ids sharing each index.
     prophet_legal = (
-        jnp.zeros((NUM_ACTIONS,), dtype=jnp.bool_)
+        jnp.zeros((NUM_ACTIONS,), dtype=jnp.int32)
         .at[idx]
         .max(legal.astype(jnp.int32))            # max == logical-or for 0/1
         .astype(jnp.bool_)
     )
 
     # prophet_to_pgx[4096]: among the LEGAL pgx ids mapping to a given prophet
-    # index, keep the smallest pgx id (selects queen-ray over underpromotions).
-    # Illegal ids are pushed to a large sentinel so they never win the min.
-    BIG = PGX_NUM_ACTIONS  # 4672, larger than any real id
+    # index, keep a deterministic pgx id. If a queen promotion and one or more
+    # underpromotions collide on the same from-to index, prefer the normal
+    # queen-promotion label. In pgx, underpromotion planes are 0..8 and normal
+    # moves are 9..72, so a raw min would incorrectly choose underpromotion.
+    BIG = PGX_NUM_ACTIONS * 3
     pgx_ids = jnp.arange(PGX_NUM_ACTIONS, dtype=jnp.int32)
-    candidate = jnp.where(legal, pgx_ids, BIG)               # int32[4672]
+    is_underpromo = (pgx_ids % PGX_FROM_STRIDE) < 9
+    ranked_ids = pgx_ids + is_underpromo.astype(jnp.int32) * PGX_NUM_ACTIONS
+    candidate = jnp.where(legal, ranked_ids, BIG)            # int32[4672]
     best = (
         jnp.full((NUM_ACTIONS,), BIG, dtype=jnp.int32)
         .at[idx]
         .min(candidate)                                       # int32[4096]
     )
-    prophet_to_pgx_ = jnp.where(best >= BIG, -1, best).astype(jnp.int32)
+    prophet_to_pgx_ = jnp.where(best >= BIG, -1, best % PGX_NUM_ACTIONS).astype(jnp.int32)
     return prophet_legal, prophet_to_pgx_
 
 
@@ -692,19 +632,27 @@ def _is_repetition_ge2(state_slice: "pgx.State") -> jax.Array:
     board), the first plane is exactly this signal.
     """
     gs = _gamestate(state_slice)
-    # Preferred: an integer "how many times has this position occurred" field.
+    hist = getattr(gs, "hash_history", None)
+    if hist is not None:
+        # pgx keeps the current position hash at history[0]. prophet's
+        # board.is_repetition(2) asks whether the current position has occurred
+        # at least twice, counting the current occurrence.
+        h = hist[0]
+        count = (hist == h).all(axis=-1).sum()
+        nonzero = ~(h == 0).all()
+        return nonzero & (count >= 2)
+
+    # Alternative: an integer "how many times has this position occurred" field.
     for name in ("hash_history_count", "repetition_count", "position_count"):
         v = getattr(gs, name, None)
         if v is not None:
             return v.astype(jnp.int32) >= 2
     # Fallback: derive from the observation's repetition planes if present.
-    # pgx obs layout: per history step, planes [12]=rep>=? . The *latest* step's
-    # first repetition plane encodes "this position seen before". This is a
-    # heavier path (touches the 119-plane obs) but is correctness-preserving.
+    # pgx obs layout: per history step, planes [12]=rep==0 and [13]=rep>=1.
+    # The latest step's second repetition plane encodes "seen before".
     obs = getattr(state_slice, "observation", None)
     if obs is not None:  # obs (8,8,119): plane 12 of the latest step = rep flag
-        # VERIFY plane index: planes 0..11 pieces, 12/13 repetition of step 0.
-        return jnp.any(obs[..., 12] > 0)
+        return jnp.any(obs[..., 13] > 0)
     # Last resort: no repetition info -> 0 (only costs the col22 feature when a
     # genuine 2-fold occurs with hm>=4; the threefold *draw* is still handled by
     # terminal_info via pgx.terminated). VERIFY.
@@ -766,6 +714,16 @@ def terminal_info(state: "pgx.State") -> Tuple[jax.Array, jax.Array]:
     return is_terminal, value
 
 
+def mover_white(state: "pgx.State") -> jax.Array:
+    """bool[B]: whether the chess side to move is White.
+
+    pgx separates chess color (``state._x.color``: 0 white, 1 black) from
+    player id (``state.current_player``), and ``env.init`` may randomize the
+    player-id order. Training/outcome code needs chess color, not player id.
+    """
+    return _gamestate(state).color.astype(jnp.int32) == 0
+
+
 # ===========================================================================
 #  Convenience: bundle the per-state derived tensors (one vmapped pass)
 # ===========================================================================
@@ -801,6 +759,7 @@ __all__ = [
     "legal_mask",
     "prophet_to_pgx",
     "terminal_info",
+    "mover_white",
     "derive_all",
     "NUM_ACTIONS",
     "FEATURES",
