@@ -1,0 +1,38 @@
+# prophet_jax — JAX/Flax port of the prophet chess engine.
+#
+# IMPORT ORDER: prophet_jax/__init__.py imports jax BEFORE any submodule (hence
+# before numpy). On Homebrew Python, numpy and jax/torch each bundle their own
+# OpenMP/BLAS (libomp) and only a jax-first (or torch-first) init is stable.
+# Keep `import prophet_jax` (or `import jax`) as the first heavy import.
+#
+# ---------------------------------------------------------------------------
+# Pick ONE jax line for your hardware, then install the rest:
+#   GPU (CUDA 12):   pip install -r requirements.txt
+#   CPU-only / Mac:  comment out the jax[cuda12] line below, uncomment plain jax,
+#                    then `pip install -r requirements.txt`. The smoke test
+#                    (smoke_test.py) runs fully on CPU — no GPU needed.
+# ---------------------------------------------------------------------------
+
+# --- JAX core (choose exactly one) -----------------------------------------
+# GPU build (NVIDIA CUDA 12 wheels bundle the CUDA runtime; needs a recent driver):
+jax[cuda12]>=0.4.34
+# CPU-only build (Linux/macOS; use this for the smoke test on a laptop):
+# jax>=0.4.34
+
+# --- JAX ecosystem ---------------------------------------------------------
+flax>=0.8.0          # linen NN (PolicyQValueNet, struct.dataclass pytrees)
+optax>=0.2.0         # adamw + clip_by_global_norm + incremental_update (EMA)
+mctx>=0.0.5          # gumbel_muzero_policy (batched Gumbel-MuZero search)
+pgx>=2.0.0           # pgx.make("chess"): batched, jittable chess env
+
+# --- Checkpoint interop + parity testing -----------------------------------
+# torch is used ONLY outside JAX, to read/write the PyTorch-format checkpoints
+# that scripts/gauntlet.py and the reference prophet/ engine consume.
+torch>=2.1
+numpy>=1.26
+python-chess>=1.11   # parity test: cross-check env.py's encode/legal/action map
+
+# NOTE: jax/flax/optax/mctx/pgx were NOT installed in the dev environment this
+# port was authored in; the modules are written against the verified library
+# APIs but have not been executed end to end. Run smoke_test.py first (CPU) to
+# shake out interface/shape issues before launching a GPU training run.
