@@ -438,6 +438,38 @@ def sample_batch(buffer: ReplayBuffer, key, batch_size: int) -> SamplesBatch:
     return buffer.sample(rng, batch_size)
 
 
+def q_target_stats(samples: SamplesBatch) -> tuple[float, float]:
+    """Host-side Q-target diagnostics for a dense sample batch.
+
+    Returns ``(mean_abs_visited_q, mean_root_visit_count)`` over valid rows.
+    These numbers are for logging only; they help distinguish a genuinely
+    learned small Q loss from a collapsed target distribution.
+    """
+    valid = np.asarray(samples.valid).astype(bool)
+    if not np.any(valid):
+        return 0.0, 0.0
+    q_weight = np.asarray(samples.q_weight)[valid]
+    q_target = np.asarray(samples.q_target)[valid]
+    visit_sum = q_weight.sum(axis=1)
+    total_weight = float(q_weight.sum())
+    mean_abs_q = (
+        float((np.abs(q_target) * q_weight).sum() / max(total_weight, 1.0))
+        if total_weight > 0.0
+        else 0.0
+    )
+    mean_visits = float(visit_sum.mean()) if visit_sum.size else 0.0
+    return mean_abs_q, mean_visits
+
+
+def q_head_played_abs(meta) -> float:
+    """Mean ``abs(q_head_played)`` over real self-play plies in ``GameMeta``."""
+    valid = np.asarray(meta.valid_ply).astype(bool)
+    if not np.any(valid):
+        return 0.0
+    qhp = np.asarray(meta.q_head_played)[valid]
+    return float(np.abs(qhp).mean()) if qhp.size else 0.0
+
+
 # ---------------------------------------------------------------------------
 # Checkpoint IO helpers (thin wrappers around the model module so the loop
 # reads naturally). The native save/load and the torch exporter all live in
@@ -602,6 +634,9 @@ def main(args: list[str] | argparse.Namespace | None = None) -> None:
     from collections import deque
     recent_plies: deque[float] = deque(maxlen=200)
     recent_decisive: deque[float] = deque(maxlen=200)
+    recent_q_abs: deque[float] = deque(maxlen=200)
+    recent_q_visits: deque[float] = deque(maxlen=200)
+    recent_qhp_abs: deque[float] = deque(maxlen=200)
 
     base_scfg = SearchConfig(sims=args.sims, root_candidates=args.candidates)
     base_stcfg = StudyConfig()
@@ -615,6 +650,7 @@ def main(args: list[str] | argparse.Namespace | None = None) -> None:
         mw.writerow([
             "games", "steps", "buffer", "avg_plies", "decisive_rate",
             "loss", "loss_pi", "loss_v", "loss_q", "loss_cons", "loss_wdl",
+            "q_target_abs", "q_root_visits", "q_head_played_abs",
             "games_per_min",
         ])
         mf.flush()
@@ -661,6 +697,10 @@ def main(args: list[str] | argparse.Namespace | None = None) -> None:
             samples, meta = generate_selfplay(
                 state.ema_params, sp_key, B, scfg, spcfg, gate
             )
+            q_abs, q_visits = q_target_stats(samples)
+            recent_q_abs.append(q_abs)
+            recent_q_visits.append(q_visits)
+            recent_qhp_abs.append(q_head_played_abs(meta))
             added = buffer.add(samples)
             games_done += B
 
@@ -720,6 +760,11 @@ def main(args: list[str] | argparse.Namespace | None = None) -> None:
                      round(float(np.mean(recent_decisive)) if recent_decisive else 0.0, 3)]
                     + [round(ema_metrics.get(k, 0.0), 4)
                        for k in ("loss", "policy", "value", "q", "consistency", "wdl")]
+                    + [
+                        round(float(np.mean(recent_q_abs)) if recent_q_abs else 0.0, 4),
+                        round(float(np.mean(recent_q_visits)) if recent_q_visits else 0.0, 2),
+                        round(float(np.mean(recent_qhp_abs)) if recent_qhp_abs else 0.0, 4),
+                    ]
                     + [round(gpm, 2)]
                 )
                 mf.flush()
@@ -740,6 +785,9 @@ def main(args: list[str] | argparse.Namespace | None = None) -> None:
                     f"[{games_done}/{args.games}] {loss_str} | "
                     f"plies {np.mean(recent_plies):.0f} "
                     f"decisive {np.mean(recent_decisive):.0%} | "
+                    f"qabs {np.mean(recent_q_abs):.3f} "
+                    f"qvis {np.mean(recent_q_visits):.1f} "
+                    f"qhp {np.mean(recent_qhp_abs):.3f} | "
                     f"buffer {len(buffer)} steps {total_steps} | "
                     f"{gpm:.1f} g/min eta {eta_h:.1f}h",
                     flush=True,
