@@ -195,6 +195,7 @@ class _Carry:
     streak_black: jnp.ndarray   # i32 [B]  consecutive low-value plies, Black to move
     resign_active: jnp.ndarray  # bool [B] this game obeys resignation (vs exempt)
     resigned_white_won: jnp.ndarray  # i8 [B]  1 White won by resign, 0 Black, -1 none
+    z_white: jnp.ndarray   # f32 [B] final outcome captured at termination, NaN if unknown
     plies: jnp.ndarray     # i32 [B]  count of real plies recorded so far
 
 
@@ -345,6 +346,20 @@ def _scan_step(static, carry: _Carry, _):
         carry.resigned_white_won,
     )
 
+    # Capture the outcome on the exact transition that ends the game. pgx
+    # rewards are transition-local; after later padding/no-op steps on an
+    # already-finished game they can read as zero, which turns mates into draws
+    # if we recompute from the final fixed-scan state.
+    child_mover_white = _mover_is_white(child_states)
+    z_terminal = _terminal_z_white(child_states, child_mover_white)
+    z_resign = jnp.where(resign_white_won == 1, 1.0, -1.0).astype(jnp.float32)
+    z_new = jnp.where(
+        resign_now,
+        z_resign,
+        jnp.where(child_is_term, z_terminal, carry.z_white),
+    )
+    z_white = jnp.where(active & jnp.isnan(carry.z_white), z_new, carry.z_white)
+
     # --- 6) bookkeeping: counts + done -----------------------------------
     plies = carry.plies + active.astype(jnp.int32)               # count real plies
     new_done = carry.done | (active & (child_is_term | child_truncated | resign_now))
@@ -377,6 +392,7 @@ def _scan_step(static, carry: _Carry, _):
         streak_black=streak_black,
         resign_active=carry.resign_active,
         resigned_white_won=resigned_white_won,
+        z_white=z_white,
         plies=plies,
     )
     return new_carry, record
@@ -419,16 +435,11 @@ def _apply_outcome_blend(record_stack, carry: _Carry, spcfg: SelfPlayConfig):
     B, T = root_value.shape
 
     # ----- final outcome per game (z_white) ------------------------------
-    # If a game resigned, the winner is fixed by resigned_white_won; otherwise
-    # read the terminal value off the FINAL live state in the carry. Truncated
-    # games (no terminal, no resign) -> NaN.
-    final_states = carry.states
-    final_mover_white = _mover_is_white(final_states)
-    z_term = _terminal_z_white(final_states, final_mover_white)  # +1/-1/0/NaN [B]
-
-    resigned = carry.resigned_white_won >= 0
-    z_resign = jnp.where(carry.resigned_white_won == 1, 1.0, -1.0)
-    z_white = jnp.where(resigned, z_resign, z_term)             # [B] (may be NaN)
+    # Captured inside the scan at the exact terminal/resignation transition.
+    # Do not recompute from ``carry.states`` here: finished games keep flowing
+    # through padding scan steps, and pgx's transition reward is not guaranteed
+    # to remain readable at the end of the fixed-length scan.
+    z_white = carry.z_white                                    # [B] (may be NaN)
 
     # ----- per-ply outcome, mirrored to the mover ------------------------
     z_white_bt = z_white[:, None]                               # [B, 1] -> [B, T]
@@ -535,6 +546,7 @@ def _generate_selfplay_impl(params, key, B, scfg, spcfg, gate):
         streak_black=jnp.zeros((B,), dtype=jnp.int32),
         resign_active=resign_active,
         resigned_white_won=-jnp.ones((B,), dtype=jnp.int8),
+        z_white=jnp.full((B,), jnp.nan, dtype=jnp.float32),
         plies=jnp.zeros((B,), dtype=jnp.int32),
     )
 
