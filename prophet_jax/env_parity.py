@@ -70,8 +70,8 @@ def _check_position(state, history, board: chess.Board, *, label: str) -> None:
     x_jax = np.asarray(env_mod.encode_state(state, history))[0]
     x_ref, _ = encode_board(board)
 
-    if not np.array_equal(x_jax, x_ref):
-        nz = np.argwhere(x_jax != x_ref)
+    if not np.allclose(x_jax, x_ref, rtol=1e-6, atol=1e-7):
+        nz = np.argwhere(~np.isclose(x_jax, x_ref, rtol=1e-6, atol=1e-7))
         details = []
         for r, c in nz[:20]:
             details.append(

@@ -518,8 +518,8 @@ class SearchOut(NamedTuple):
       * ``policy_target`` f32[B,4096] — the Gumbel-improved distribution
         (``policy_output.action_weights``); already sums to 1 over legal moves.
         **This is the policy training target.**
-      * ``root_value``    f32[B]     — backed-up root value
-        (``tree.node_values[:, ROOT_INDEX]``).
+      * ``root_value``    f32[B]     — moonshot backed-up root value:
+        ``(v_root + sum(visits * child_q)) / (1 + sum(visits))``.
       * ``q_target``      f32[B,4096] — root-perspective empirical Q per action
         (``tree.summary().qvalues``); dense, 0 where the qtransform leaves it.
       * ``q_weight``      f32[B,4096] — child visit counts at the root
@@ -549,7 +549,7 @@ def _extract_tree_stats(policy_output: mctx.PolicyOutput):
     policy_target = policy_output.action_weights                   # [B, 4096]
 
     root_index = mctx.Tree.ROOT_INDEX                              # == 0
-    root_value = tree.node_values[:, root_index]                  # [B]
+    root_value = tree.node_values[:, root_index]                  # [B] fallback only
 
     # Per-action root-perspective Q (the qtransform's completed Q) and the
     # per-child visit counts at the root.
@@ -582,7 +582,9 @@ def search_result(
       * ``move_index``    = ``policy_output.action``.
       * ``policy_target`` = ``policy_output.action_weights`` (Gumbel-improved,
         sums to 1 over legal — the train target).
-      * ``root_value``    = ``tree.node_values[:, Tree.ROOT_INDEX]``.
+      * ``root_value``    = the moonshot blend of root network value and
+        visit-weighted empirical child Q:
+        ``(v_root + sum(visits * child_q)) / (1 + sum(visits))``.
       * ``q_target``      = ``tree.summary().qvalues`` (root-perspective Q).
       * ``q_weight``      = ``tree.children_visits[:, Tree.ROOT_INDEX]`` (visit
         counts per child; 0 -> unvisited, used as the Q-regression weight so
@@ -604,9 +606,24 @@ def search_result(
     else:
         if history is None:
             history = empty_history(state)
-        _logits, q4096, _v = model_forward(params, encode_state(state, history))  # [B,4096]
+        _logits, q4096, v_root = model_forward(
+            params, encode_state(state, history)
+        )  # [B,4096], [B]
         batch = move_index.shape[0]
         q_head_played = q4096[jnp.arange(batch), move_index]             # [B]
+        # Moonshot reference formula from prophet/search.py:
+        #
+        #   q_avg = sum(child.visits * -child.mean) / n_sum
+        #   root_value = (v_root + n_sum * q_avg) / (1 + n_sum)
+        #
+        # mctx's root node bookkeeping is an implementation detail and can
+        # exclude or normalize the root network value differently. Training and
+        # surprise detection should consume the same scalar the working
+        # moonshot branch trained on, so rebuild it from the root network value
+        # and the empirical root-perspective child Q targets.
+        visit_sum = jnp.sum(q_weight, axis=-1)
+        q_sum = jnp.sum(q_target * q_weight, axis=-1)
+        root_value = (v_root + q_sum) / (1.0 + visit_sum)
 
     return SearchOut(
         move_index=move_index,
