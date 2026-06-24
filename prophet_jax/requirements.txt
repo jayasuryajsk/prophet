@@ -32,7 +32,6 @@ torch>=2.1
 numpy>=1.26
 python-chess>=1.11   # parity test: cross-check env.py's encode/legal/action map
 
-# NOTE: jax/flax/optax/mctx/pgx were NOT installed in the dev environment this
-# port was authored in; the modules are written against the verified library
-# APIs but have not been executed end to end. Run smoke_test.py first (CPU) to
-# shake out interface/shape issues before launching a GPU training run.
+# Before launching a GPU training run, run:
+#   python -m prophet_jax.smoke_test
+#   python -m prophet_jax.env_parity --plies 160 --check-all-actions-every 16

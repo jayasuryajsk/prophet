@@ -25,9 +25,8 @@ STEP 1 — SURPRISE DETECTION (:func:`find_surprises`)
 STEP 2 — DEEP RE-ANALYSIS (:func:`reflect_batch`, deep phase)
     Gather the ``M`` per-ply :class:`pgx.State` snapshots from
     ``meta.states_per_ply`` (this is why self-play stores per-ply states — bare
-    FEN reconstruction with history columns zeroed is the reference behavior, so
-    history feature columns 18..21 are zeroed on these re-searched positions to
-    match ``study.py``).  Run ONE batched deep search
+    FEN reconstruction has an empty move stack in ``study.py``, so surprise
+    roots start with empty history).  Run ONE batched deep search
     (``sims=deep_sims, root_candidates=deep_candidates, q_trust=<live>``) over
     all ``M`` states and build a deep-study :class:`Sample` per surprise with
     policy/Q/value targets all from the deep search and ``weight=study_weight``.
@@ -39,8 +38,10 @@ STEP 3 — COUNTERFACTUAL BRANCHES (:func:`reflect_batch`, branch phase)
     is the surprise state stepped by that alternate move, then a branch of up to
     ``branch_plies`` is played at the NORMAL budget ``scfg`` via a single
     ``lax.scan`` (like self-play but a fixed short length, ``weight=branch_weight``).
-    If a branch reaches terminal, the outcome is mixed into every branch
-    sample's value target (truncated branches keep the pure search value).
+    The alternate move and later branch moves populate history planes just like
+    python-chess move_stack. If a branch reaches terminal, the outcome is mixed
+    into every branch sample's value target (truncated branches keep the pure
+    search value).
 
 All ``M`` surprises and all ``M * n_lines`` branches batch together, so the
 whole thing is a fixed number of big jitted ``batched_search`` calls — no
@@ -509,7 +510,7 @@ def reflect_batch(
          ``batched_search`` call (``sims=deep_sims``,
          ``root_candidates=deep_candidates``, ``q_trust=scfg.q_trust``).  Build
          ``M`` deep-study samples (``weight=study_weight``, value =
-         deep ``root_value``, history columns zeroed).
+         deep ``root_value``; surprise roots use empty bare-FEN history).
       3. For each surprise take the ``n_lines`` best alternate moves (empirical
          deep-search Q); step a FRESH copy of the surprise state by each; play a
          branch of up to ``branch_plies`` at the normal budget ``scfg`` in one

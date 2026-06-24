@@ -170,20 +170,15 @@ Outputs (under `--out`): `latest.npz` (native EMA checkpoint), `latest.pt`
 
 ## Caveats (read before trusting a run)
 
-This port was authored in an environment where **jax/flax/optax/mctx/pgx were
-not installed**, so the modules are written against the verified library APIs but
-have **not been executed end to end**. Before a real run:
+Before trusting a real run:
 
 1. **Run `smoke_test.py`** (CPU) to catch interface/shape/JIT issues.
-2. **Write and run the env-bridge parity test** (described at the top of
-   `env.py`). It must cross-check, over random positions, that `encode_state`,
-   `legal_mask`, and the `prophet_to_pgx` action map agree with python-chess /
-   the reference `encoding.py`. The pgx-internal field names, the LERF
-   square-numbering assumption, and the `^56` flip parity are all marked
-   `# VERIFY:` in `env.py` and are the highest-value things to pin — they are the
-   JAX analogue of the Rust core's 31099-position bit-identity check.
-3. **Known approximation:** mctx's interior qtransform completes unvisited-action
-   Q from a value mixture, so prophet's exact PUCT-with-`q_init` interior is *not*
-   bit-reproducible here (the Gumbel **root** algorithm, which prophet also uses,
-   *is*). See the `search.py` docstring. `q_trust` / `c_puct` / `c_visit` /
-   `c_scale` are carried for interface parity but do not change the mctx search.
+2. **Run the env-bridge parity harness:**
+   `python -m prophet_jax.env_parity --plies 160 --check-all-actions-every 16`.
+   It cross-checks `encode_state(state, history)`, `legal_mask`, and legal child
+   stepping against python-chess / the reference `encoding.py`, including the
+   moonshot last-two-move history planes.
+3. **Known search boundary:** mctx still owns the batched tree storage and
+   backup loop. The JAX wrapper supplies moonshot's Q-head first-play values and
+   PUCT interior selector, but the root sequential-halving machinery is mctx's
+   implementation rather than a hand-rolled line-for-line Python generator.

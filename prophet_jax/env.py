@@ -30,11 +30,11 @@ bit-identity check. A fresh test MUST assert, over a batch of random
 positions, that:
 
   * ``legal_mask(state)``      == ``encoding.legal_move_map`` (as a 4096 bool),
-  * ``encode_state(state)``    == ``encoding.encode_board`` (FEN-reconstructed),
-  * ``prophet_to_pgx(state)``  steps to the same position python-chess reaches.
+  * ``encode_state(state, history)`` == ``encoding.encode_board``,
+  * ``prophet_to_pgx(state)``        steps to the same position python-chess reaches.
 
-See ``tests/test_env_bridge.py`` (the parity harness) — until that test is
-green, treat every "# VERIFY:" below as a live risk.
+See ``python -m prophet_jax.env_parity`` (the parity harness) — until that test
+is green, treat every "# VERIFY:" below as a live risk.
 
 pgx internals this module assumes (VERIFY against installed pgx/chess.py)
 ------------------------------------------------------------------------
