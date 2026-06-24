@@ -637,6 +637,9 @@ def main(args: list[str] | argparse.Namespace | None = None) -> None:
     recent_q_abs: deque[float] = deque(maxlen=200)
     recent_q_visits: deque[float] = deque(maxlen=200)
     recent_qhp_abs: deque[float] = deque(maxlen=200)
+    recent_study_q_abs: deque[float] = deque(maxlen=200)
+    recent_study_q_visits: deque[float] = deque(maxlen=200)
+    recent_study_rows: deque[float] = deque(maxlen=200)
 
     base_scfg = SearchConfig(sims=args.sims, root_candidates=args.candidates)
     base_stcfg = StudyConfig()
@@ -651,6 +654,7 @@ def main(args: list[str] | argparse.Namespace | None = None) -> None:
             "games", "steps", "buffer", "avg_plies", "decisive_rate",
             "loss", "loss_pi", "loss_v", "loss_q", "loss_cons", "loss_wdl",
             "q_target_abs", "q_root_visits", "q_head_played_abs",
+            "study_q_target_abs", "study_q_root_visits", "study_rows",
             "games_per_min",
         ])
         mf.flush()
@@ -721,6 +725,10 @@ def main(args: list[str] | argparse.Namespace | None = None) -> None:
                 study_samples = reflect_batch(
                     state.ema_params, rf_key, meta, meta.states_per_ply, stcfg, scfg
                 )
+                study_q_abs, study_q_visits = q_target_stats(study_samples)
+                recent_study_q_abs.append(study_q_abs)
+                recent_study_q_visits.append(study_q_visits)
+                recent_study_rows.append(float(np.asarray(study_samples.valid).sum()))
                 new_samples += buffer.add(study_samples)
 
             # ---------- (d) training ----------
@@ -764,6 +772,9 @@ def main(args: list[str] | argparse.Namespace | None = None) -> None:
                         round(float(np.mean(recent_q_abs)) if recent_q_abs else 0.0, 4),
                         round(float(np.mean(recent_q_visits)) if recent_q_visits else 0.0, 2),
                         round(float(np.mean(recent_qhp_abs)) if recent_qhp_abs else 0.0, 4),
+                        round(float(np.mean(recent_study_q_abs)) if recent_study_q_abs else 0.0, 4),
+                        round(float(np.mean(recent_study_q_visits)) if recent_study_q_visits else 0.0, 2),
+                        round(float(np.mean(recent_study_rows)) if recent_study_rows else 0.0, 1),
                     ]
                     + [round(gpm, 2)]
                 )
@@ -788,6 +799,8 @@ def main(args: list[str] | argparse.Namespace | None = None) -> None:
                     f"qabs {np.mean(recent_q_abs):.3f} "
                     f"qvis {np.mean(recent_q_visits):.1f} "
                     f"qhp {np.mean(recent_qhp_abs):.3f} | "
+                    f"sqabs {(np.mean(recent_study_q_abs) if recent_study_q_abs else 0.0):.3f} "
+                    f"srows {(np.mean(recent_study_rows) if recent_study_rows else 0.0):.0f} | "
                     f"buffer {len(buffer)} steps {total_steps} | "
                     f"{gpm:.1f} g/min eta {eta_h:.1f}h",
                     flush=True,
