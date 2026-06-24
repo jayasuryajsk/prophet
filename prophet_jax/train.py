@@ -400,6 +400,12 @@ class ReplayBuffer:
         n = int(keep.size)
         if n == 0:
             return 0
+        # A large A100 self-play round can emit more valid rows than the replay
+        # ring can retain. Keep only the suffix that would survive the wrap
+        # anyway, before pulling the dense policy/Q tensors back to host.
+        if n > self.capacity:
+            keep = keep[-self.capacity:]
+            n = self.capacity
         # Pull each field to host numpy once, keep only valid rows.
         fields = {
             name: np.asarray(getattr(samples, name))[keep]
