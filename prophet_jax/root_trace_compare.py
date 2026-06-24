@@ -17,18 +17,13 @@ from __future__ import annotations
 
 import argparse
 import tempfile
-from functools import partial
 from pathlib import Path
 from typing import Any
 
 import chess
 import jax
 import jax.numpy as jnp
-import mctx
 import numpy as np
-from mctx._src import action_selection as mctx_action_selection
-from mctx._src import search as mctx_search
-from mctx._src import seq_halving as mctx_seq_halving
 
 from prophet.encoding import encode_board, legal_move_map
 from prophet.fastboard import PyChessBoard
@@ -42,9 +37,6 @@ from .model import build_model, export_torch_checkpoint
 from .search import (
     _gumbel_root_puct_policy,
     _invalid_actions,
-    _mask_logits_from_invalid,
-    _puct_interior_action_selection,
-    _qtransform_qinit,
     recurrent_fn,
     root_fn,
     search_result,
@@ -117,58 +109,22 @@ def _run_jax_fixed_gumbel(
     """Run current JAX/mctx search with a caller-supplied root Gumbel vector."""
     root = root_fn(params, state, history)
     invalid = _invalid_actions(state)
-    root = root.replace(
-        prior_logits=_mask_logits_from_invalid(root.prior_logits, invalid)
-    )
-    qtransform = partial(
-        _qtransform_qinit,
-        q_trust=cfg.q_trust,
-        c_visit=cfg.c_visit,
-        c_scale=cfg.c_scale,
-    )
     gumbel = jnp.asarray(gumbel_full, dtype=root.prior_logits.dtype)[None, :]
-    tree = mctx_search.search(
+    policy_output = _gumbel_root_puct_policy(
         params=params,
         rng_key=key,
         root=root,
-        recurrent_fn=recurrent_fn,
-        root_action_selection_fn=partial(
-            mctx_action_selection.gumbel_muzero_root_action_selection,
-            num_simulations=cfg.sims,
-            max_num_considered_actions=cfg.root_candidates,
-            qtransform=qtransform,
-        ),
-        interior_action_selection_fn=partial(
-            _puct_interior_action_selection,
-            q_trust=cfg.q_trust,
-            c_puct=cfg.c_puct,
-        ),
+        recurrent_fn_=recurrent_fn,
         num_simulations=cfg.sims,
         invalid_actions=invalid,
-        extra_data=mctx_action_selection.GumbelMuZeroExtraData(root_gumbel=gumbel),
+        max_num_considered_actions=cfg.root_candidates,
+        q_trust=cfg.q_trust,
+        c_visit=cfg.c_visit,
+        c_scale=cfg.c_scale,
+        c_puct=cfg.c_puct,
+        root_gumbel=gumbel,
     )
-    summary = tree.summary()
-    completed_qvalues = jax.vmap(qtransform, in_axes=[0, None])(
-        tree, tree.ROOT_INDEX
-    )
-    considered_visit = jnp.max(summary.visit_counts, axis=-1, keepdims=True)
-    to_argmax = mctx_seq_halving.score_considered(
-        considered_visit,
-        gumbel,
-        root.prior_logits,
-        completed_qvalues,
-        summary.visit_counts,
-    )
-    action = mctx_action_selection.masked_argmax(to_argmax, invalid)
-    weights = jax.nn.softmax(
-        _mask_logits_from_invalid(root.prior_logits + completed_qvalues, invalid)
-    )
-    policy_output = mctx.PolicyOutput(
-        action=action,
-        action_weights=weights,
-        search_tree=tree,
-    )
-    return search_result(policy_output, state, params, history), root, tree
+    return search_result(policy_output, state, params, history), root, policy_output.search_tree
 
 
 def _run_jax_stock(
@@ -338,14 +294,14 @@ def run_compare(args: argparse.Namespace) -> int:
                 f"visited={len(torch_trace['indices'])}"
             )
             print(
-                "jax-mctx "
+                "jax-exact "
                 f"move={_move_for_action(board, jax_trace['move'])} "
                 f"root={jax_trace['root']:+.4f} qabs={jax_trace['qabs']:.4f} "
                 f"visited={len(jax_trace['indices'])}"
             )
             print(f"visited overlap: {ov}/{union}")
             print(f"initial top moonshot logits+g: {' '.join(moon_top)}")
-            print(f"initial top mctx logits+g+q: {' '.join(mctx_top)}")
+            print(f"initial top q-biased old-mctx: {' '.join(mctx_top)}")
             print(f"moonshot visits: {_format_visit_list(board, torch_trace, args.list)}")
             print(f"jax visits:      {_format_visit_list(board, jax_trace, args.list)}")
 

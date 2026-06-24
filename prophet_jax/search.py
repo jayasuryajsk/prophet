@@ -9,13 +9,11 @@ stock Full Gumbel MuZero selector end-to-end.
 
 What maps closely
 -----------------
-* **Root algorithm.** This currently uses mctx's Gumbel Sequential Halving
-  scheduler with prophet-shaped Q completion. That is close enough for batched
-  training to run, but it is NOT byte-for-byte identical to
-  ``prophet/search.py``: mctx's root candidate scoring can include completed Q,
-  while moonshot's first candidate set is selected from ``logits + gumbel``.
-  Use ``python -m prophet_jax.root_trace_compare`` to inspect that remaining
-  root scheduling gap before changing this path.
+* **Root algorithm.** A custom root selector reproduces moonshot's root loop:
+  the initial candidate set is selected from ``logits + gumbel`` only, then
+  each phase visits the current candidate list in order before pruning by
+  ``logits + gumbel + sigma(completed_q)``. mctx still owns array-backed tree
+  storage, expansion, and backup.
 * **Action space.** We keep mctx's action space equal to prophet's 4096
   (``from*64 + to``). mctx only has an explicit invalid-action mask at the
   root, so we also mask policy logits at every expanded child node; otherwise
@@ -37,10 +35,10 @@ What maps closely
 
 Implementation note
 -------------------
-mctx owns the batched simulation/expansion/backup loop. Root selection is the
-stock mctx Gumbel sequential halving with prophet Q-completion; interior
-selection is prophet's PUCT formula over legal-only children, with unvisited
-children completed from the Q-head.
+mctx owns the batched simulation/expansion/backup loop. Root selection is
+moonshot's Gumbel/sequential-halving schedule; interior selection is prophet's
+PUCT formula over legal-only children, with unvisited children completed from
+the Q-head.
 
 Everything here is pure JAX so an entire batch of games searches in one
 ``jax.jit``-compiled call (no per-search python/numpy tree ops, unlike the
@@ -49,6 +47,7 @@ reference generator engine).
 
 from __future__ import annotations
 
+import math
 from functools import partial
 from typing import Any, NamedTuple
 
@@ -57,7 +56,6 @@ import jax.numpy as jnp
 import mctx
 from mctx._src import action_selection as mctx_action_selection
 from mctx._src import search as mctx_search
-from mctx._src import seq_halving as mctx_seq_halving
 
 # --- prophet_jax siblings -------------------------------------------------
 # env.py provides the pgx State half of the mctx embedding.
@@ -215,6 +213,110 @@ def _puct_interior_action_selection(
     return mctx_action_selection.masked_argmax(score, invalid)
 
 
+def _moonshot_root_tables(
+    max_num_considered_actions: int,
+    num_simulations: int,
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """Phase start/target visit counts for moonshot's root loop.
+
+    ``prophet/search.py`` visits all actions in ``remaining`` for ``per`` sims,
+    then sorts/prunes ``remaining``. In mctx the root selector is called once per
+    simulation, so these static tables let the selector reconstruct the current
+    moonshot phase from the root visit counts.
+    """
+    starts: list[tuple[int, ...]] = []
+    targets: list[tuple[int, ...]] = []
+    for m in range(max_num_considered_actions + 1):
+        row_start: list[int] = []
+        row_target: list[int] = []
+        if m <= 0:
+            row_start = [0] * num_simulations
+            row_target = [1] * num_simulations
+        else:
+            remaining = m
+            start = 0
+            phases = max(1, math.ceil(math.log2(m))) if m > 1 else 1
+            while len(row_start) < num_simulations:
+                per = max(1, num_simulations // (phases * max(1, remaining)))
+                target = start + per
+                for _ in range(remaining):
+                    for _ in range(per):
+                        if len(row_start) >= num_simulations:
+                            break
+                        row_start.append(start)
+                        row_target.append(target)
+                    if len(row_start) >= num_simulations:
+                        break
+                start = target
+                if remaining > 1:
+                    remaining = max(1, remaining // 2)
+                elif len(row_start) >= num_simulations:
+                    break
+        starts.append(tuple(row_start[:num_simulations]))
+        targets.append(tuple(row_target[:num_simulations]))
+    return tuple(starts), tuple(targets)
+
+
+def _moonshot_root_action_selection(
+    rng_key: Any,
+    tree: mctx.Tree,
+    node_index: jnp.ndarray,
+    *,
+    num_simulations: int,
+    max_num_considered_actions: int,
+    q_trust: float,
+    c_visit: float,
+    c_scale: float,
+) -> jnp.ndarray:
+    """Root selector matching ``prophet.search.run_search_gen``.
+
+    Initial candidate order is ``gumbel + logits`` only. After a phase has
+    visited each remaining action, the next phase ranks candidates by moonshot's
+    ``base_by_idx[i] + sigma(completed_q(i))``.
+    """
+    del rng_key
+    visit_counts = tree.children_visits[node_index]
+    prior_logits = tree.children_prior_logits[node_index]
+    invalid = tree.root_invalid_actions.astype(bool)
+
+    starts, targets = _moonshot_root_tables(
+        max_num_considered_actions, num_simulations
+    )
+    start_table = jnp.asarray(starts, dtype=jnp.int32)
+    target_table = jnp.asarray(targets, dtype=jnp.int32)
+
+    num_valid_actions = jnp.sum((~invalid).astype(jnp.int32), axis=-1)
+    num_considered = jnp.minimum(
+        jnp.asarray(max_num_considered_actions, dtype=jnp.int32),
+        num_valid_actions,
+    )
+    simulation_index = jnp.sum(visit_counts, axis=-1).astype(jnp.int32)
+    phase_start = start_table[num_considered, simulation_index]
+    phase_target = target_table[num_considered, simulation_index]
+
+    base = tree.extra_data.root_gumbel + prior_logits
+    raw_q = _raw_completed_q(tree, node_index, q_trust=q_trust)
+    phase_q = (c_visit + phase_start.astype(jnp.float32)) * c_scale * raw_q
+    ranked_score = jnp.where(phase_start == 0, base, base + phase_q)
+
+    # If an action is midway through its per-action visit quota, keep visiting
+    # it. That reproduces moonshot's inner ``for _ in range(per)`` loop.
+    partial = (visit_counts > phase_start) & (visit_counts < phase_target)
+    partial_action = mctx_action_selection.masked_argmax(
+        visit_counts.astype(jnp.float32),
+        invalid | (~partial),
+    )
+
+    # Otherwise pick the next action from the current phase frontier. The
+    # frontier is exactly the actions whose visit count equals phase_start.
+    frontier = visit_counts == phase_start
+    frontier_action = mctx_action_selection.masked_argmax(
+        ranked_score,
+        invalid | (~frontier),
+    )
+    return jnp.where(jnp.any(partial), partial_action, frontier_action)
+
+
 def _gumbel_root_puct_policy(
     params: Any,
     rng_key: Any,
@@ -229,15 +331,19 @@ def _gumbel_root_puct_policy(
     c_scale: float,
     c_puct: float,
     gumbel_scale: float = 1.0,
+    root_gumbel: jnp.ndarray | None = None,
 ) -> mctx.PolicyOutput:
     """mctx policy with Prophet root Gumbel and Prophet interior PUCT."""
     root = root.replace(
         prior_logits=_mask_logits_from_invalid(root.prior_logits, invalid_actions)
     )
-    rng_key, gumbel_rng = jax.random.split(rng_key)
-    gumbel = gumbel_scale * jax.random.gumbel(
-        gumbel_rng, shape=root.prior_logits.shape, dtype=root.prior_logits.dtype
-    )
+    if root_gumbel is None:
+        rng_key, gumbel_rng = jax.random.split(rng_key)
+        gumbel = gumbel_scale * jax.random.gumbel(
+            gumbel_rng, shape=root.prior_logits.shape, dtype=root.prior_logits.dtype
+        )
+    else:
+        gumbel = root_gumbel.astype(root.prior_logits.dtype)
     qtransform = partial(
         _qtransform_qinit,
         q_trust=q_trust,
@@ -250,10 +356,12 @@ def _gumbel_root_puct_policy(
         root=root,
         recurrent_fn=recurrent_fn_,
         root_action_selection_fn=partial(
-            mctx_action_selection.gumbel_muzero_root_action_selection,
+            _moonshot_root_action_selection,
             num_simulations=num_simulations,
             max_num_considered_actions=max_num_considered_actions,
-            qtransform=qtransform,
+            q_trust=q_trust,
+            c_visit=c_visit,
+            c_scale=c_scale,
         ),
         interior_action_selection_fn=partial(
             _puct_interior_action_selection,
@@ -266,18 +374,14 @@ def _gumbel_root_puct_policy(
     )
     summary = search_tree.summary()
 
-    considered_visit = jnp.max(summary.visit_counts, axis=-1, keepdims=True)
     completed_qvalues = jax.vmap(qtransform, in_axes=[0, None])(
         search_tree, search_tree.ROOT_INDEX
     )
-    to_argmax = mctx_seq_halving.score_considered(
-        considered_visit,
-        gumbel,
-        root.prior_logits,
-        completed_qvalues,
-        summary.visit_counts,
+    final_visit = jnp.max(summary.visit_counts, axis=-1, keepdims=True)
+    action = mctx_action_selection.masked_argmax(
+        gumbel + root.prior_logits + completed_qvalues,
+        invalid_actions.astype(bool) | (summary.visit_counts != final_visit),
     )
-    action = mctx_action_selection.masked_argmax(to_argmax, invalid_actions)
 
     completed_search_logits = _mask_logits_from_invalid(
         root.prior_logits + completed_qvalues, invalid_actions
