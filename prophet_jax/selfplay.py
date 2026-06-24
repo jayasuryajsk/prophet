@@ -185,6 +185,7 @@ RESULT_UNFINISHED = -1  # "*"  (truncated without a terminal)
 @struct.dataclass
 class _Carry:
     states: Any            # pgx State, batched over B (the live positions)
+    history: jnp.ndarray   # i32 [B, 4] last-two-move squares in current model space
     key: jnp.ndarray       # [2] PRNG key, split each step
     done: jnp.ndarray      # bool [B]  game finished (terminal OR resigned)
     ply: jnp.ndarray       # i32 scalar  current ply index (0..max_plies-1)
@@ -286,7 +287,7 @@ def _scan_step(static, carry: _Carry, _):
 
     # --- 1) batched search on the live positions -------------------------
     # search returns dense per-game targets (see search.SearchOut).
-    out = batched_search(params, search_key, carry.states, scfg)
+    out = batched_search(params, search_key, carry.states, scfg, carry.history)
 
     move_index = out.move_index.astype(jnp.int32)     # [B]
     policy_target = out.policy_target.astype(jnp.float32)  # [B, A] sums to 1 over legal
@@ -296,7 +297,7 @@ def _scan_step(static, carry: _Carry, _):
     q_head_played = out.q_head_played.astype(jnp.float32)  # [B]
 
     # --- 2) record parent-side features / targets ------------------------
-    x = env_mod.encode_state(carry.states).astype(jnp.float32)   # [B, 64, F]
+    x = env_mod.encode_state(carry.states, carry.history).astype(jnp.float32)   # [B, 64, F]
     mask = env_mod.legal_mask(carry.states)                      # bool [B, A]
     mover_white = _mover_is_white(carry.states)                 # bool [B]
 
@@ -309,7 +310,9 @@ def _scan_step(static, carry: _Carry, _):
     # For finished games this is a no-op (terminated pgx state). We still call
     # it uniformly so the scan stays branch-free; the snapshot/sample is masked.
     child_states = env_mod.env_step(carry.states, move_index)
-    child_x = env_mod.encode_state(child_states).astype(jnp.float32)  # [B, 64, F]
+    raw_child_history = env_mod.update_history(carry.history, move_index)
+    child_history = jnp.where(active[:, None], raw_child_history, carry.history)
+    child_x = env_mod.encode_state(child_states, child_history).astype(jnp.float32)  # [B, 64, F]
 
     # --- 4) terminal detection on the child ------------------------------
     child_is_term, _ = env_mod.terminal_info(child_states)       # bool [B]
@@ -361,10 +364,12 @@ def _scan_step(static, carry: _Carry, _):
         q_head_played=q_head_played,  # [B]
         valid=valid_ply,           # [B]
         state=_lite_state(carry.states),  # lite State (no 30KB observation)
+        history=carry.history,     # [B, 4] root move-stack history for this ply
     )
 
     new_carry = _Carry(
         states=child_states,
+        history=child_history,
         key=key,
         done=new_done,
         ply=carry.ply + 1,
@@ -507,6 +512,7 @@ def _generate_selfplay_impl(params, key, B, scfg, spcfg, gate):
     key, init_key, resign_key = jax.random.split(key, 3)
     start_keys = env_mod.start_keys(init_key, B)     # [B] PRNGKeys for env.init
     states = env_mod.env_init(start_keys)            # batched pgx State
+    history = env_mod.empty_history(states)          # [B, 4], moonshot move-stack flags
 
     # --- per-game resignation activation ---------------------------------
     # resign_active = gate AND (draw >= resign_off_prob). The gate is a python
@@ -521,6 +527,7 @@ def _generate_selfplay_impl(params, key, B, scfg, spcfg, gate):
 
     carry0 = _Carry(
         states=states,
+        history=history,
         key=key,
         done=jnp.zeros((B,), dtype=bool),
         ply=jnp.int32(0),

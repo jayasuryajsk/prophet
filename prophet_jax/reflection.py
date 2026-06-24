@@ -69,34 +69,20 @@ from .config import (
 )
 from .env import (
     encode_state,
+    empty_history,
     env_step,
     legal_mask,
     mover_white,
     terminal_info,
+    update_history,
 )
 from .search import batched_search
 from .selfplay import SamplesBatch
-
-# History feature columns (last two moves' from/to square flags).  Positions
-# reconstructed from a bare FEN have no move stack, so study.py leaves these
-# zeroed; we replicate that by masking these columns on every re-searched
-# surprise/branch position.  See prophet/encoding.py cols 18..21.
-HISTORY_COLS = (18, 19, 20, 21)
 
 
 # ---------------------------------------------------------------------------
 # Small dense-sample helpers (shared schema with selfplay.SamplesBatch).
 # ---------------------------------------------------------------------------
-def _zero_history(x):
-    """Zero the history feature columns 18..21 of an encoded batch.
-
-    ``x`` is ``[..., 64, F]``.  Matches study.py's bare-FEN reconstruction,
-    where there is no move stack so the last-two-moves planes are all zero.
-    """
-    cols = jnp.asarray(HISTORY_COLS)
-    return x.at[..., :, cols].set(0.0)
-
-
 def _empty_samples(n: int) -> SamplesBatch:
     """An all-padding :class:`SamplesBatch` of length ``n`` (``valid=False``).
 
@@ -127,6 +113,7 @@ def _samples_from_search(
     weight,
     valid,
     wdl=None,
+    history=None,
 ) -> SamplesBatch:
     """Build a dense :class:`SamplesBatch` from a batched search output.
 
@@ -149,7 +136,9 @@ def _samples_from_search(
         samples are excluded from the WDL loss).
     """
     n = out.move_index.shape[0]
-    x = _zero_history(encode_state(state))  # [n, 64, F]
+    if history is None:
+        history = empty_history(state)
+    x = encode_state(state, history)  # [n, 64, F]
     mask = legal_mask(state)  # [n, A] bool
     if wdl is None:
         wdl = jnp.full((n,), -1, dtype=jnp.int32)
@@ -158,7 +147,7 @@ def _samples_from_search(
     )
     return SamplesBatch(
         x=x,
-        child_x=_zero_history(child_x),
+        child_x=child_x,
         played=out.move_index.astype(jnp.int32),
         value=value_target.astype(jnp.float32),
         weight=weight_arr,
@@ -313,7 +302,14 @@ def _top_line_actions(out, n_lines: int):
     return line_actions, line_valid
 
 
-def _play_branch(params, key, start_state, scfg: SearchConfig, branch_plies: int):
+def _play_branch(
+    params,
+    key,
+    start_state,
+    start_history,
+    scfg: SearchConfig,
+    branch_plies: int,
+):
     """Play one counterfactual branch per element at the NORMAL budget ``scfg``.
 
     A vectorized analogue of ``study._play_branch_gen``: from ``start_state``
@@ -352,19 +348,21 @@ def _play_branch(params, key, start_state, scfg: SearchConfig, branch_plies: int
     # spec'd constant 0.5.  If StudyConfig is threaded in, read stcfg.outcome_mix.
 
     def step(carry, _):
-        state, done, key = carry
+        state, history, done, key = carry
         key, sub = jax.random.split(key)
         # mover color BEFORE the move (pgx: current_player is the side to move;
         # we record the white-mover flag the same way selfplay/meta does).
         mover_white = _mover_is_white(state)  # [G] bool  # VERIFY: see helper
         active = ~done  # branches still running this ply
-        out = batched_search(params, sub, state, scfg)  # SearchOut over [G]
+        out = batched_search(params, sub, state, scfg, history)  # SearchOut over [G]
 
         # Encode child_x: the position after the chosen move (for consistency
         # loss).  We step a copy of the state to get it, then advance the real
         # state only for branches that are still active.
         next_state = env_step(state, out.move_index.astype(jnp.int32))
-        child_x = _zero_history(encode_state(next_state))  # [G, 64, F]
+        next_history_raw = update_history(history, out.move_index.astype(jnp.int32))
+        next_history = jnp.where(active[:, None], next_history_raw, history)
+        child_x = encode_state(next_state, next_history)  # [G, 64, F]
 
         # This ply produces a valid sample only for branches active at its start.
         sample = _samples_from_search(
@@ -374,10 +372,12 @@ def _play_branch(params, key, start_state, scfg: SearchConfig, branch_plies: int
             value_target=out.root_value,
             weight=1.0,  # branch_weight; re-weighted at the end via `valid`
             valid=active,
+            history=history,
         )
 
         # Advance only active branches; finished branches hold their state.
         new_state = _select_state(active, next_state, state)
+        new_history = jnp.where(active[:, None], next_history, history)
         # Did this ply's resulting position terminate?  (only meaningful for
         # branches that were active).  term_val is the side-to-move value at the
         # resulting position: -1 == checkmate (side to move lost), 0 == draw.
@@ -392,11 +392,11 @@ def _play_branch(params, key, start_state, scfg: SearchConfig, branch_plies: int
             "is_term_here": term_here,  # [G] branch reached terminal at this ply
             "term_val": term_val,  # [G] side-to-move value of the resulting pos
         }
-        return (new_state, new_done, key), (sample, extras)
+        return (new_state, new_history, new_done, key), (sample, extras)
 
     done0 = jnp.zeros((G,), dtype=jnp.bool_)
-    (_final_state, final_done, _), (samples_scan, extras) = jax.lax.scan(
-        step, (start_state, done0, key), xs=None, length=branch_plies
+    (_final_state, _final_history, final_done, _), (samples_scan, extras) = jax.lax.scan(
+        step, (start_state, start_history, done0, key), xs=None, length=branch_plies
     )
     # samples_scan / extras leaves have leading dims [P, G, ...].
     #
@@ -567,13 +567,18 @@ def reflect_batch(
         q_trust=scfg.q_trust,  # inherit the live q_trust
     )
     key, deep_key = jax.random.split(key)
-    deep_out = batched_search(params, deep_key, surprise_states, deep_cfg)  # [M]
+    surprise_history = empty_history(surprise_states)
+    deep_out = batched_search(
+        params, deep_key, surprise_states, deep_cfg, surprise_history
+    )  # [M]
 
-    # child_x for each surprise: encode the position after the deep search's
-    # chosen move (history-zeroed, since the surprise position itself is a
-    # bare-FEN reconstruction with no move stack).
+    # child_x for each surprise: the surprise root has empty bare-FEN history,
+    # then the deep search move becomes the child's last-move feature.
     deep_child_state = env_step(surprise_states, deep_out.move_index.astype(jnp.int32))
-    deep_child_x = _zero_history(encode_state(deep_child_state))  # [M, 64, F]
+    deep_child_history = update_history(
+        surprise_history, deep_out.move_index.astype(jnp.int32)
+    )
+    deep_child_x = encode_state(deep_child_state, deep_child_history)  # [M, 64, F]
 
     deep_samples = _samples_from_search(
         surprise_states,
@@ -582,6 +587,7 @@ def reflect_batch(
         value_target=deep_out.root_value,
         weight=float(stcfg.study_weight),
         valid=keep,  # only kept surprises are real samples
+        history=surprise_history,
     )
 
     parts: list[SamplesBatch] = [deep_samples]
@@ -612,10 +618,16 @@ def reflect_batch(
         # env_step well-defined we substitute action 0 for invalid lines.
         safe_actions = jnp.where(flat_line_real, flat_actions, jnp.int32(0))
         branch_start = env_step(tiled_states, safe_actions)  # [G] fresh per line
+        branch_start_history = update_history(empty_history(tiled_states), safe_actions)
 
         key, branch_key = jax.random.split(key)
         branch_samples = _play_branch(
-            params, branch_key, branch_start, scfg, int(stcfg.branch_plies)
+            params,
+            branch_key,
+            branch_start,
+            branch_start_history,
+            scfg,
+            int(stcfg.branch_plies),
         )  # [G * P]
 
         # Mask out every sample belonging to an invalid line (replicate the

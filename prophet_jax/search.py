@@ -3,9 +3,9 @@
 This is the JAX port of ``prophet/search.py``. The reference engine runs a
 Gumbel top-k + sequential-halving selection at the *root* and PUCT in the
 *interior*, with unvisited children seeded by the network's per-move Q-head
-(``q_trust * q_init``). We reproduce that as closely as the Gumbel-MuZero
-*formulation* allows by wrapping ``mctx.gumbel_muzero_policy`` and running it
-fully batched / vmapped over thousands of positions in a single compiled call.
+(``q_trust * q_init``). We keep mctx's fully batched tree storage and backup,
+but plug in the prophet-shaped action-selection rules instead of using the
+stock Full Gumbel MuZero selector end-to-end.
 
 What maps closely
 -----------------
@@ -35,12 +35,11 @@ What maps closely
   completed-Q distribution that already sums to 1 over legal moves) is the
   training target — the analogue of prophet's ``policy_target``.
 
-Remaining approximation
------------------------
-mctx's interior action-selection rule is still Full Gumbel MuZero, not
-prophet's exact Python PUCT formula. The important load-bearing semantics are
-preserved: legal-only child selection, two-player negamax backup, and Q-head
-first-play completion for unvisited actions.
+Implementation note
+-------------------
+mctx owns the batched simulation/expansion/backup loop. Root selection is
+mctx's Gumbel sequential halving; interior selection is prophet's PUCT formula
+over legal-only children, with unvisited children completed from the Q-head.
 
 Everything here is pure JAX so an entire batch of games searches in one
 ``jax.jit``-compiled call (no per-search python/numpy tree ops, unlike the
@@ -49,15 +48,26 @@ reference generator engine).
 
 from __future__ import annotations
 
+from functools import partial
 from typing import Any, NamedTuple
 
 import jax
 import jax.numpy as jnp
 import mctx
+from mctx._src import action_selection as mctx_action_selection
+from mctx._src import search as mctx_search
+from mctx._src import seq_halving as mctx_seq_halving
 
 # --- prophet_jax siblings -------------------------------------------------
 # env.py provides the pgx State half of the mctx embedding.
-from .env import encode_state, env_step, legal_mask, terminal_info
+from .env import (
+    encode_state,
+    empty_history,
+    env_step,
+    legal_mask,
+    terminal_info,
+    update_history,
+)
 
 # Network forward: (params, x[B,64,F]) -> (policy_logits[B,4096], q[B,4096], v[B]).
 #
@@ -85,10 +95,8 @@ except Exception:  # pragma: no cover
     class SearchConfig:  # type: ignore[no-redef]
         """Fallback mirror of prophet's SearchConfig (+ deep variants).
 
-        The interior-PUCT knobs are retained for interface parity. ``c_visit``,
-        ``c_scale``, and ``q_trust`` are used by the custom qtransform; mctx's
-        interior action-selection rule itself is still Gumbel MuZero rather
-        than prophet's exact Python PUCT formula.
+        ``c_puct`` controls the interior selector. ``c_visit``, ``c_scale``,
+        and ``q_trust`` control the root completed-Q transform.
         """
 
         sims: int = 32
@@ -102,9 +110,10 @@ except Exception:  # pragma: no cover
 
 
 class _SearchEmbedding(NamedTuple):
-    """mctx node embedding: the pgx state plus this node's raw Q-head vector."""
+    """mctx node embedding: pgx state, move history, and raw Q-head vector."""
 
     state: Any
+    history: jnp.ndarray
     q_init: jnp.ndarray
 
 
@@ -147,13 +156,145 @@ def _qtransform_qinit(
     return visit_scale * c_scale * completed
 
 
+def _raw_completed_q(
+    tree: mctx.Tree,
+    node_index: jnp.ndarray,
+    *,
+    q_trust: float,
+) -> jnp.ndarray:
+    """Unscaled Prophet first-play Q for interior PUCT.
+
+    The root Gumbel selector uses ``sigma(q) = (c_visit + max_visits) * c_scale
+    * q`` via :func:`_qtransform_qinit`, matching ``run_search_gen``. Interior
+    PUCT in the Python engine uses the raw completed Q directly.
+    """
+    qvalues = tree.qvalues(node_index)
+    visit_counts = tree.children_visits[node_index]
+    q_init = tree.embeddings.q_init[node_index]
+    return jnp.where(visit_counts > 0, qvalues, q_trust * q_init)
+
+
+def _invalid_actions_from_prior_logits(prior_logits: jnp.ndarray) -> jnp.ndarray:
+    """Recover an invalid-action mask from logits pre-masked by env legality."""
+    min_logit = jnp.finfo(prior_logits.dtype).min
+    return prior_logits <= (min_logit * 0.5)
+
+
+def _mask_logits_from_invalid(
+    logits: jnp.ndarray,
+    invalid_actions: jnp.ndarray | None,
+) -> jnp.ndarray:
+    """Mask invalid logits using mctx's invalid-action convention."""
+    if invalid_actions is None:
+        return logits
+    invalid = invalid_actions.astype(bool)
+    min_logit = jnp.finfo(logits.dtype).min
+    return jnp.where(invalid, min_logit, logits)
+
+
+def _puct_interior_action_selection(
+    rng_key: Any,
+    tree: mctx.Tree,
+    node_index: jnp.ndarray,
+    depth: jnp.ndarray,
+    *,
+    q_trust: float,
+    c_puct: float,
+) -> jnp.ndarray:
+    """Prophet's interior selector: raw completed-Q + PUCT prior bonus."""
+    del rng_key, depth
+    visit_counts = tree.children_visits[node_index].astype(jnp.float32)
+    node_visits = tree.node_visits[node_index].astype(jnp.float32)
+    prior_logits = tree.children_prior_logits[node_index]
+    prior_probs = jax.nn.softmax(prior_logits)
+    q = _raw_completed_q(tree, node_index, q_trust=q_trust)
+    sqrt_n = jnp.sqrt(jnp.maximum(node_visits, 1.0))
+    score = q + c_puct * prior_probs * sqrt_n / (1.0 + visit_counts)
+    invalid = _invalid_actions_from_prior_logits(prior_logits)
+    return mctx_action_selection.masked_argmax(score, invalid)
+
+
+def _gumbel_root_puct_policy(
+    params: Any,
+    rng_key: Any,
+    root: mctx.RootFnOutput,
+    recurrent_fn_: Any,
+    num_simulations: int,
+    invalid_actions: jnp.ndarray,
+    max_num_considered_actions: int,
+    *,
+    q_trust: float,
+    c_visit: float,
+    c_scale: float,
+    c_puct: float,
+    gumbel_scale: float = 1.0,
+) -> mctx.PolicyOutput:
+    """mctx policy with Prophet root Gumbel and Prophet interior PUCT."""
+    root = root.replace(
+        prior_logits=_mask_logits_from_invalid(root.prior_logits, invalid_actions)
+    )
+    rng_key, gumbel_rng = jax.random.split(rng_key)
+    gumbel = gumbel_scale * jax.random.gumbel(
+        gumbel_rng, shape=root.prior_logits.shape, dtype=root.prior_logits.dtype
+    )
+    qtransform = partial(
+        _qtransform_qinit,
+        q_trust=q_trust,
+        c_visit=c_visit,
+        c_scale=c_scale,
+    )
+    search_tree = mctx_search.search(
+        params=params,
+        rng_key=rng_key,
+        root=root,
+        recurrent_fn=recurrent_fn_,
+        root_action_selection_fn=partial(
+            mctx_action_selection.gumbel_muzero_root_action_selection,
+            num_simulations=num_simulations,
+            max_num_considered_actions=max_num_considered_actions,
+            qtransform=qtransform,
+        ),
+        interior_action_selection_fn=partial(
+            _puct_interior_action_selection,
+            q_trust=q_trust,
+            c_puct=c_puct,
+        ),
+        num_simulations=num_simulations,
+        invalid_actions=invalid_actions,
+        extra_data=mctx_action_selection.GumbelMuZeroExtraData(root_gumbel=gumbel),
+    )
+    summary = search_tree.summary()
+
+    considered_visit = jnp.max(summary.visit_counts, axis=-1, keepdims=True)
+    completed_qvalues = jax.vmap(qtransform, in_axes=[0, None])(
+        search_tree, search_tree.ROOT_INDEX
+    )
+    to_argmax = mctx_seq_halving.score_considered(
+        considered_visit,
+        gumbel,
+        root.prior_logits,
+        completed_qvalues,
+        summary.visit_counts,
+    )
+    action = mctx_action_selection.masked_argmax(to_argmax, invalid_actions)
+
+    completed_search_logits = _mask_logits_from_invalid(
+        root.prior_logits + completed_qvalues, invalid_actions
+    )
+    return mctx.PolicyOutput(
+        action=action,
+        action_weights=jax.nn.softmax(completed_search_logits),
+        search_tree=search_tree,
+    )
+
+
 # --------------------------------------------------------------------------
 # Root and recurrent functions (the mctx model contract).
 # --------------------------------------------------------------------------
-def root_fn(params: Any, state: Any) -> mctx.RootFnOutput:
+def root_fn(params: Any, state: Any, history: jnp.ndarray | None = None) -> mctx.RootFnOutput:
     """Build the mctx root from a batched pgx ``State``.
 
-    Runs ``model.forward`` on ``encode_state(state)`` to get
+    Runs ``model.forward`` on ``encode_state(state, history)`` to get
     ``(policy_logits[B,4096], q[B,4096], v[B])`` and returns:
 
       * ``prior_logits`` = policy logits with illegal actions masked out. mctx
@@ -165,12 +306,14 @@ def root_fn(params: Any, state: Any) -> mctx.RootFnOutput:
         the custom qtransform reads ``q`` back out for unvisited-action
         completion.
     """
-    x = encode_state(state)  # f32[B, 64, FEATURES]
+    if history is None:
+        history = empty_history(state)
+    x = encode_state(state, history)  # f32[B, 64, FEATURES]
     policy_logits, q, v = model_forward(params, x)
     return mctx.RootFnOutput(
         prior_logits=_mask_illegal_logits(policy_logits, state),  # [B, 4096]
         value=v,                             # [B]
-        embedding=_SearchEmbedding(state=state, q_init=q),  # opaque to mctx
+        embedding=_SearchEmbedding(state=state, history=history, q_init=q),  # opaque to mctx
     )
 
 
@@ -198,12 +341,15 @@ def recurrent_fn(params: Any, rng_key: Any, action: jnp.ndarray, embedding: Any)
     mating move +1 for the parent.
     """
     state = embedding.state
+    history = embedding.history
 
     # action: [B] int32 (prophet index). env_step maps 4096 -> pgx 4672 and
     # steps without auto-reset.
-    next_state = env_step(state, action.astype(jnp.int32))
+    action = action.astype(jnp.int32)
+    next_state = env_step(state, action)
+    next_history = update_history(history, action)
 
-    x_child = encode_state(next_state)                 # f32[B, 64, F]
+    x_child = encode_state(next_state, next_history)   # f32[B, 64, F]
     child_logits, child_q, child_v = model_forward(params, x_child)
 
     is_terminal, terminal_value = terminal_info(next_state)  # bool[B], f32[B]
@@ -226,7 +372,7 @@ def recurrent_fn(params: Any, rng_key: Any, action: jnp.ndarray, embedding: Any)
         prior_logits=_mask_illegal_logits(child_logits, next_state),  # [B, 4096]
         value=value,                                   # [B] network value (non-terminal)
     )
-    return out, _SearchEmbedding(state=next_state, q_init=child_q)
+    return out, _SearchEmbedding(state=next_state, history=next_history, q_init=child_q)
 
 
 # --------------------------------------------------------------------------
@@ -234,54 +380,43 @@ def recurrent_fn(params: Any, rng_key: Any, action: jnp.ndarray, embedding: Any)
 # --------------------------------------------------------------------------
 # We jit the ENTIRE search pipeline as one compiled call: build the root
 # (root_fn -> one batched model.forward), build the legal-move mask, then run
-# gumbel_muzero_policy (which traces recurrent_fn -> one batched env_step +
-# model.forward per simulation step). So a whole batch of games searches in a
-# single jit boundary, exactly as the spec wants. The Gumbel/qtransform knobs
-# are keyword-only (note the bare ``*`` in the mctx signature); gumbel_scale=1.0
-# keeps the reference root exploration. num_simulations / candidates / Q-scale
-# knobs are static to the compiled function, so we cache by all of them.
-#
-# VERIFY: argument names/positions of mctx.gumbel_muzero_policy
-# (params, rng_key, root, recurrent_fn, num_simulations, invalid_actions=...,
-#  *, qtransform=..., max_num_considered_actions=..., gumbel_scale=...).
-# These match the verified mctx/_src/policies.py signature. We pass a custom
-# qtransform so unvisited children use prophet's Q-head first-play value.
-_SEARCH_CACHE: dict[tuple[int, int, float, float, float], Any] = {}
+# mctx_search.search with Prophet's root/interior action-selection functions.
+# num_simulations / candidates / Q-scale knobs are static to the compiled
+# function, so we cache by all of them.
+_SEARCH_CACHE: dict[tuple[int, int, float, float, float, float], Any] = {}
 
 
 def _make_search_fn(
     num_simulations: int,
     max_num_considered_actions: int,
     q_trust: float,
+    c_puct: float,
     c_visit: float,
     c_scale: float,
 ):
     """Build a jitted ``(params, key, state) -> PolicyOutput`` search closure.
 
-    Closes over the two python-int budgets (static to mctx) so each distinct
-    budget compiles once. The whole body — root_fn, the invalid-actions mask,
-    and gumbel_muzero_policy — lives inside the single ``jax.jit``.
+    Closes over the static search knobs so each distinct budget/config compiles
+    once. The whole body — root_fn, the invalid-actions mask, and mctx tree
+    search — lives inside the single ``jax.jit``.
     """
 
-    def _search(params, key, state):
-        root = root_fn(params, state)               # one batched model.forward
+    def _search(params, key, state, history):
+        root = root_fn(params, state, history)      # one batched model.forward
         invalid = _invalid_actions(state)           # [B, 4096], 1.0 = illegal
-        return mctx.gumbel_muzero_policy(
-            params,
-            key,
-            root,
-            recurrent_fn,
-            num_simulations,
+        return _gumbel_root_puct_policy(
+            params=params,
+            rng_key=key,
+            root=root,
+            recurrent_fn_=recurrent_fn,
+            num_simulations=num_simulations,
             invalid_actions=invalid,
             max_num_considered_actions=max_num_considered_actions,
+            q_trust=q_trust,
+            c_visit=c_visit,
+            c_scale=c_scale,
+            c_puct=c_puct,
             gumbel_scale=1.0,
-            qtransform=lambda tree, node_index: _qtransform_qinit(
-                tree,
-                node_index,
-                q_trust=q_trust,
-                c_visit=c_visit,
-                c_scale=c_scale,
-            ),
         )
 
     return jax.jit(_search)
@@ -291,6 +426,7 @@ def _get_search_fn(
     num_simulations: int,
     max_num_considered_actions: int,
     q_trust: float,
+    c_puct: float,
     c_visit: float,
     c_scale: float,
 ):
@@ -299,17 +435,24 @@ def _get_search_fn(
         int(num_simulations),
         int(max_num_considered_actions),
         float(q_trust),
+        float(c_puct),
         float(c_visit),
         float(c_scale),
     )
     fn = _SEARCH_CACHE.get(key)
     if fn is None:
-        fn = _make_search_fn(key[0], key[1], key[2], key[3], key[4])
+        fn = _make_search_fn(key[0], key[1], key[2], key[3], key[4], key[5])
         _SEARCH_CACHE[key] = fn
     return fn
 
 
-def run_search(params: Any, key: Any, state: Any, cfg: SearchConfig) -> mctx.PolicyOutput:
+def run_search(
+    params: Any,
+    key: Any,
+    state: Any,
+    cfg: SearchConfig,
+    history: jnp.ndarray | None = None,
+) -> mctx.PolicyOutput:
     """Run one batched Gumbel-MuZero search over ``state`` and return PolicyOutput.
 
     ``state`` is a *batched* pgx ``State`` (leading batch dim B). Returns the
@@ -325,13 +468,22 @@ def run_search(params: Any, key: Any, state: Any, cfg: SearchConfig) -> mctx.Pol
         cfg.sims,
         cfg.root_candidates,
         cfg.q_trust,
+        cfg.c_puct,
         cfg.c_visit,
         cfg.c_scale,
     )
-    return search_fn(params, key, state)
+    if history is None:
+        history = empty_history(state)
+    return search_fn(params, key, state, history)
 
 
-def deep_search(params: Any, key: Any, state: Any, cfg: SearchConfig) -> mctx.PolicyOutput:
+def deep_search(
+    params: Any,
+    key: Any,
+    state: Any,
+    cfg: SearchConfig,
+    history: jnp.ndarray | None = None,
+) -> mctx.PolicyOutput:
     """Deep-reflection variant: identical to :func:`run_search` but at the deep
     budget (``cfg.deep_sims`` simulations, ``cfg.deep_candidates`` root
     candidates). Used by reflection.py to re-analyse surprising positions.
@@ -342,10 +494,13 @@ def deep_search(params: Any, key: Any, state: Any, cfg: SearchConfig) -> mctx.Po
         deep_sims,
         deep_candidates,
         cfg.q_trust,
+        cfg.c_puct,
         cfg.c_visit,
         cfg.c_scale,
     )
-    return search_fn(params, key, state)
+    if history is None:
+        history = empty_history(state)
+    return search_fn(params, key, state, history)
 
 
 # --------------------------------------------------------------------------
@@ -411,6 +566,7 @@ def search_result(
     policy_output: mctx.PolicyOutput,
     state: Any,
     params: Any = None,
+    history: jnp.ndarray | None = None,
 ) -> SearchOut:
     """Extract the prophet-shaped, batched :class:`SearchOut` from a PolicyOutput.
 
@@ -446,7 +602,9 @@ def search_result(
         # a hard error so the bare two-arg call still returns a valid SearchOut.
         q_head_played = jnp.zeros_like(root_value)
     else:
-        _logits, q4096, _v = model_forward(params, encode_state(state))  # [B,4096]
+        if history is None:
+            history = empty_history(state)
+        _logits, q4096, _v = model_forward(params, encode_state(state, history))  # [B,4096]
         batch = move_index.shape[0]
         q_head_played = q4096[jnp.arange(batch), move_index]             # [B]
 
@@ -460,7 +618,13 @@ def search_result(
     )
 
 
-def batched_search(params: Any, key: Any, state: Any, cfg: SearchConfig) -> SearchOut:
+def batched_search(
+    params: Any,
+    key: Any,
+    state: Any,
+    cfg: SearchConfig,
+    history: jnp.ndarray | None = None,
+) -> SearchOut:
     """``run_search`` + :func:`search_result` in one call: PolicyOutput -> SearchOut.
 
     This is the high-level entry the rest of prophet_jax uses (selfplay /
@@ -468,16 +632,26 @@ def batched_search(params: Any, key: Any, state: Any, cfg: SearchConfig) -> Sear
     call, then the dense, batched SearchOut is extracted (one extra batched
     forward for the root Q-head used in ``q_head_played``).
     """
-    policy_output = run_search(params, key, state, cfg)
-    return search_result(policy_output, state, params)
+    if history is None:
+        history = empty_history(state)
+    policy_output = run_search(params, key, state, cfg, history)
+    return search_result(policy_output, state, params, history)
 
 
-def batched_deep_search(params: Any, key: Any, state: Any, cfg: SearchConfig) -> SearchOut:
+def batched_deep_search(
+    params: Any,
+    key: Any,
+    state: Any,
+    cfg: SearchConfig,
+    history: jnp.ndarray | None = None,
+) -> SearchOut:
     """Deep-reflection analogue of :func:`batched_search` (uses ``deep_search``).
 
     Re-analyses positions at ``cfg.deep_sims`` / ``cfg.deep_candidates`` and
     returns the same dense SearchOut, so reflection.py can build high-weight
     study samples with sharper targets.
     """
-    policy_output = deep_search(params, key, state, cfg)
-    return search_result(policy_output, state, params)
+    if history is None:
+        history = empty_history(state)
+    policy_output = deep_search(params, key, state, cfg, history)
+    return search_result(policy_output, state, params, history)

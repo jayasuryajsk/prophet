@@ -53,7 +53,7 @@ Public API (matches the module plan in the spec)
     start_keys(master_key, B)        -> keys[B]
     env_init(keys[B])                -> State            (vmapped pgx init)
     env_step(state, prophet_action[B]) -> State          (4096->4672, no reset)
-    encode_state(state)              -> x f32[B,64,24]
+    encode_state(state, history=None)-> x f32[B,64,24]
     legal_mask(state)                -> bool[B,4096]      (queen-promo only)
     prophet_to_pgx(state)            -> int32[B,4096]     (pgx action or -1)
     terminal_info(state)             -> (is_terminal bool[B], value f32[B])
@@ -83,6 +83,7 @@ FEATURES = 24                   # prophet encode_board feature columns
 PGX_NUM_ACTIONS = 64 * 73       # pgx chess action space                (4672)
 PGX_FROM_STRIDE = 73            # pgx action = from_sq*73 + move_type
 DRAW_HALFMOVE_CAP = 100         # fifty-move rule (halfmove clock cap)
+NO_HISTORY = -1                 # sentinel for absent last-move square flags
 
 # python-chess / prophet square convention is LERF: square = rank*8 + file,
 # A1 = 0, H1 = 7, A8 = 56, H8 = 63. The ^56 model-space flip is a *rank* flip
@@ -588,17 +589,10 @@ def _encode_single(state_slice: "pgx.State") -> jax.Array:
     x = x.at[:, 17].set(jnp.minimum(hm, 100.0) / 100.0)
 
     # --- history (cols 18..21) ---------------------------------------------
-    # DOCUMENTED FALLBACK: pgx's public State does not cheaply expose the last
-    # two *moves* (only an 8-step *board* history of planes). prophet zeroes
-    # these columns for any position lacking a move_stack (bare-FEN / study
-    # branches), and the project explicitly tolerates that as a known accuracy
-    # cost, not a transfer breaker. We therefore leave 18..21 = 0.
-    #
-    # If a future port reconstructs the last move from pgx's two most recent
-    # board-history planes (diff of consecutive own/opp piece planes -> the
-    # from/to of the move that produced the current board), populate cols 18/19
-    # (and 20/21 from the prior pair) here, remapping squares with
-    # ``_pgx_sq_to_model``. Leaving zero is the safe, spec-sanctioned default.
+    # Filled by encode_state(..., history=...) below. A bare pgx State does not
+    # carry the action ids needed to reproduce python-chess move_stack exactly,
+    # so callers that own the move sequence thread a compact [B,4] history array.
+    # Positions reconstructed from bare FENs intentionally pass empty history.
     # (cols 18..21 already zero)
 
     # --- repetition (col 22, broadcast; only when halfmove>=4) -------------
@@ -659,7 +653,47 @@ def _is_repetition_ge2(state_slice: "pgx.State") -> jax.Array:
     return jnp.bool_(False)
 
 
-def encode_state(state: "pgx.State") -> jax.Array:
+def empty_history(state: "pgx.State") -> jax.Array:
+    """Return an empty last-two-move history array for a batched state.
+
+    Layout is ``[last_from, last_to, prev_from, prev_to]`` in the *current*
+    side-to-move model space. ``NO_HISTORY`` marks absent moves, matching
+    python-chess boards reconstructed from bare FENs.
+    """
+    B = jnp.asarray(state.legal_action_mask).shape[0]
+    return jnp.full((B, 4), NO_HISTORY, dtype=jnp.int32)
+
+
+def update_history(history: jax.Array, prophet_action: jax.Array) -> jax.Array:
+    """Advance move-stack history after applying ``prophet_action``.
+
+    ``prophet_action`` is in the parent side-to-move's model space. The child
+    position is viewed from the opponent's model space, so square flags flip by
+    ``^56``. The previous last move also flips into the child frame.
+    """
+    action = prophet_action.astype(jnp.int32)
+    last_from = (action // 64) ^ 56
+    last_to = (action % 64) ^ 56
+
+    prev = history[:, 0:2]
+    prev_flipped = jnp.where(prev >= 0, prev ^ 56, NO_HISTORY).astype(jnp.int32)
+    return jnp.concatenate(
+        [last_from[:, None], last_to[:, None], prev_flipped], axis=1
+    )
+
+
+def _apply_history(x: jax.Array, history: jax.Array) -> jax.Array:
+    """Set moonshot history planes 18..21 from a compact ``[B,4]`` history."""
+    hist = history.astype(jnp.int32)
+    for offset, col in enumerate((18, 19, 20, 21)):
+        sq = hist[:, offset]
+        valid = sq >= 0
+        one_hot = jax.nn.one_hot(jnp.clip(sq, 0, 63), 64, dtype=x.dtype)
+        x = x.at[:, :, col].set(one_hot * valid[:, None].astype(x.dtype))
+    return x
+
+
+def encode_state(state: "pgx.State", history: jax.Array | None = None) -> jax.Array:
     """Batched prophet encoding: ``State`` -> x f32[B, 64, 24].
 
     Channels-last and token-major already (64 tokens x 24 features) — the model
@@ -668,7 +702,10 @@ def encode_state(state: "pgx.State") -> jax.Array:
     119-plane observation), in prophet model space (^56-flip parity folded into
     ``_pgx_sq_to_model``).
     """
-    return jax.vmap(_encode_single)(state)
+    x = jax.vmap(_encode_single)(state)
+    if history is None:
+        return x
+    return _apply_history(x, history)
 
 
 # ===========================================================================
@@ -756,6 +793,8 @@ __all__ = [
     "env_init",
     "env_step",
     "encode_state",
+    "empty_history",
+    "update_history",
     "legal_mask",
     "prophet_to_pgx",
     "terminal_info",
