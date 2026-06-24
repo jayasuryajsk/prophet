@@ -9,13 +9,13 @@ stock Full Gumbel MuZero selector end-to-end.
 
 What maps closely
 -----------------
-* **Root algorithm.** ``gumbel_muzero_policy`` *natively* does Gumbel top-k
-  candidate selection + Sequential Halving over
-  ``min(num_simulations, max_num_considered_actions)`` actions. Setting
-  ``num_simulations = cfg.sims`` (32), ``max_num_considered_actions =
-  cfg.root_candidates`` (8) and ``gumbel_scale = 1.0`` makes mctx's root match
-  prophet's root algorithm (Gumbel draw on raw logits, deterministic argmax of
-  the halving). This *is* what the policy does out of the box.
+* **Root algorithm.** This currently uses mctx's Gumbel Sequential Halving
+  scheduler with prophet-shaped Q completion. That is close enough for batched
+  training to run, but it is NOT byte-for-byte identical to
+  ``prophet/search.py``: mctx's root candidate scoring can include completed Q,
+  while moonshot's first candidate set is selected from ``logits + gumbel``.
+  Use ``python -m prophet_jax.root_trace_compare`` to inspect that remaining
+  root scheduling gap before changing this path.
 * **Action space.** We keep mctx's action space equal to prophet's 4096
   (``from*64 + to``). mctx only has an explicit invalid-action mask at the
   root, so we also mask policy logits at every expanded child node; otherwise
@@ -37,9 +37,10 @@ What maps closely
 
 Implementation note
 -------------------
-mctx owns the batched simulation/expansion/backup loop. Root selection is
-mctx's Gumbel sequential halving; interior selection is prophet's PUCT formula
-over legal-only children, with unvisited children completed from the Q-head.
+mctx owns the batched simulation/expansion/backup loop. Root selection is the
+stock mctx Gumbel sequential halving with prophet Q-completion; interior
+selection is prophet's PUCT formula over legal-only children, with unvisited
+children completed from the Q-head.
 
 Everything here is pure JAX so an entire batch of games searches in one
 ``jax.jit``-compiled call (no per-search python/numpy tree ops, unlike the
