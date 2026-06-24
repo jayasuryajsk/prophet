@@ -270,12 +270,10 @@ def _terminal_z_white(states: Any, mover_white: jnp.ndarray) -> jnp.ndarray:
     # 0 = draw. Convert to White's frame: z_white = stm_value if mover White
     # else -stm_value. (mate: stm_value=-1 -> White=-1 when White to move.)
     z_white = jnp.where(mover_white, stm_value, -stm_value).astype(jnp.float32)
-    # At scan-end a non-terminated game is TRUNCATED (hit the ply cap) = a DRAW
-    # (real chess adjudication: a game nobody won is drawn). Score it 0.0, NOT
-    # NaN — NaN games get masked out of training, which starves the value/Q heads
-    # when most games are long (the drawish-collapse bug). Draw 0 -> the outcome
-    # blend applies -contempt, giving the heads a real signal on long games.
-    return jnp.where(is_term, z_white, 0.0)
+    # A self-play ply cap is not a chess result. Keep cap-truncated games as
+    # unknown outcomes: their policy/Q/search-value rows still enter replay, but
+    # outcome blending and WDL supervision are skipped, matching prophet/selfplay.py.
+    return jnp.where(is_term, z_white, jnp.nan)
 
 
 def _scan_step(static, carry: _Carry, _):

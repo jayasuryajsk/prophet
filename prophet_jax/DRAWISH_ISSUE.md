@@ -8,12 +8,24 @@ produces 0% decisive games**. New probes (§3) localize the bug to the
 prophet's search is *measurably worse than uniform-random play* at delivering
 checkmate. This doc has the evidence and the next diagnostics.
 
-> TL;DR for Codex: don't re-chase the discount sign (it's correct, traced below).
-> The signature is **symmetric draw-seeking** — both sides avoid winning. Hunt a
-> **residual value-sign / perspective inversion** in (a) the mctx root value
-> convention, (b) the Gumbel qtransform under `discount=-1`, or (c) the train-time
-> value/consistency target perspective. Start with diagnostic **D1
-> (search-vs-random)** — it's the clincher and ~30 lines.
+**Codex update, same date:** two additional JAX-only issues were fixed after
+this handoff was written:
+
+1. mctx only masks invalid actions at the root. Interior simulations were
+   selecting illegal chess actions, which `env_step` guarded by clamping to pgx
+   action 0; pgx then emitted illegal-action terminal rewards. `search.py` now
+   masks logits at every expanded node.
+2. The Q-head was not actually participating in JAX search. `q_trust` was a dead
+   config field. mctx node embeddings now carry each node's raw Q-head vector,
+   and the custom qtransform completes unvisited actions with
+   `q_trust * q_init`.
+3. Self-play ply-cap truncations are again unknown outcomes (`NaN`) rather than
+   fake draws. Policy/Q rows still enter replay, but WDL/outcome blending are
+   skipped, matching the PyTorch reference.
+
+> Original TL;DR for Codex: don't re-chase the discount sign (it's correct,
+> traced below). The follow-up fix found two non-discount causes: unmasked
+> interior illegal actions and dead `q_trust`/Q-head completion in mctx.
 
 ---
 

@@ -7,7 +7,7 @@ Gumbel top-k + sequential-halving selection at the *root* and PUCT in the
 *formulation* allows by wrapping ``mctx.gumbel_muzero_policy`` and running it
 fully batched / vmapped over thousands of positions in a single compiled call.
 
-What maps exactly
+What maps closely
 -----------------
 * **Root algorithm.** ``gumbel_muzero_policy`` *natively* does Gumbel top-k
   candidate selection + Sequential Halving over
@@ -17,39 +17,30 @@ What maps exactly
   prophet's root algorithm (Gumbel draw on raw logits, deterministic argmax of
   the halving). This *is* what the policy does out of the box.
 * **Action space.** We keep mctx's action space equal to prophet's 4096
-  (``from*64 + to``) and pass ``invalid_actions = ~legal_mask`` so search only
-  ever considers legal from-to moves. The env layer (``env.py``) handles the
-  4096 -> pgx-4672 remap inside ``env_step``; mctx never sees pgx's 4672 layout.
+  (``from*64 + to``). mctx only has an explicit invalid-action mask at the
+  root, so we also mask policy logits at every expanded child node; otherwise
+  interior simulations can select illegal chess moves and poison Q targets with
+  pgx illegal-action terminal rewards. The env layer handles the 4096 -> pgx
+  4672 remap inside ``env_step``; mctx never sees pgx's 4672 layout.
+* **Q-head completion.** Each mctx node embedding carries the raw per-action
+  Q-head vector for that node. The custom qtransform completes unvisited
+  children with ``q_trust * q_init`` and uses empirical tree Q for visited
+  children, matching prophet's first-play-value idea while keeping mctx's
+  batched tree machinery.
 * **Terminal handling.** ``recurrent_fn`` returns ``discount = 0`` at terminal
   children (cutting the value bootstrap, matching prophet's terminal handling)
-  and overrides the child value with the true mate/draw ``terminal_value`` so
-  the backup uses the real outcome.
+  and routes the true terminal outcome through ``reward`` from the parent's
+  perspective, so a mating move backs up as +1.
 * **Policy target.** ``policy_output.action_weights`` (the Gumbel-improved,
   completed-Q distribution that already sums to 1 over legal moves) is the
   training target — the analogue of prophet's ``policy_target``.
 
-What is *approximated* (NOT bit-reproducible under mctx)
--------------------------------------------------------
-Prophet's interior PUCT seeds an *unvisited* child with ``q_trust * q_init``
-(the Q-head value of the move into that child) as its first-play value. mctx's
-default ``qtransform_completed_by_mix_value`` instead completes unvisited-action
-Q from a *value mixture* of the parent value and the visited children's Q. There
-is no exact, bit-for-bit way to inject prophet's per-action ``q_init`` as the
-unvisited first-play value through the public mctx API:
-
-  - Folding ``q_trust * q`` into ``prior_logits`` (as a temperature shift) is
-    **not** equivalent — it changes the prior/Gumbel weighting, not the
-    completed-Q used by the qtransform.
-  - The qtransform is what consumes per-action Q, and it derives unvisited Q
-    from the value mixture, not from a user-supplied per-action initial value.
-
-So we *document* that exact PUCT-with-``q_init`` is not reproducible here and
-accept that the interior selection differs. We still seed the Q-head into the
-tree everywhere it *is* expressible: the per-action Q-head value flows in as the
-root/child ``value`` and (for the root) as the network priors, and we rely on
-the Gumbel root algorithm (which prophet itself uses at the root) to be the
-behaviourally-dominant part at these tiny sim budgets. The interior PUCT
-difference is the accepted approximation.
+Remaining approximation
+-----------------------
+mctx's interior action-selection rule is still Full Gumbel MuZero, not
+prophet's exact Python PUCT formula. The important load-bearing semantics are
+preserved: legal-only child selection, two-player negamax backup, and Q-head
+first-play completion for unvisited actions.
 
 Everything here is pure JAX so an entire batch of games searches in one
 ``jax.jit``-compiled call (no per-search python/numpy tree ops, unlike the
@@ -65,7 +56,7 @@ import jax.numpy as jnp
 import mctx
 
 # --- prophet_jax siblings -------------------------------------------------
-# env.py threads the *pgx State* through mctx as the opaque embedding.
+# env.py provides the pgx State half of the mctx embedding.
 from .env import encode_state, env_step, legal_mask, terminal_info
 
 # Network forward: (params, x[B,64,F]) -> (policy_logits[B,4096], q[B,4096], v[B]).
@@ -94,11 +85,10 @@ except Exception:  # pragma: no cover
     class SearchConfig:  # type: ignore[no-redef]
         """Fallback mirror of prophet's SearchConfig (+ deep variants).
 
-        The interior-PUCT knobs (``c_puct`` / ``c_visit`` / ``c_scale``) are
-        retained for interface parity but are NOT used by the mctx wrapper —
-        mctx fixes its own Gumbel/qtransform constants. ``q_trust`` is likewise
-        carried for parity (and surprise-detection callers) but cannot be
-        injected into mctx's completed-Q; see the module docstring.
+        The interior-PUCT knobs are retained for interface parity. ``c_visit``,
+        ``c_scale``, and ``q_trust`` are used by the custom qtransform; mctx's
+        interior action-selection rule itself is still Gumbel MuZero rather
+        than prophet's exact Python PUCT formula.
         """
 
         sims: int = 32
@@ -111,11 +101,50 @@ except Exception:  # pragma: no cover
         deep_candidates: int = 16
 
 
+class _SearchEmbedding(NamedTuple):
+    """mctx node embedding: the pgx state plus this node's raw Q-head vector."""
+
+    state: Any
+    q_init: jnp.ndarray
+
+
 # mctx marks ILLEGAL actions with 1.0 in ``invalid_actions`` (legal -> 0.0).
 # legal_mask(state) is True at LEGAL actions, so invalid = logical-not.
 def _invalid_actions(state: Any) -> jnp.ndarray:
     """[B, NUM_ACTIONS] float32, 1.0 at illegal actions (mctx convention)."""
     return (~legal_mask(state)).astype(jnp.float32)
+
+
+def _mask_illegal_logits(logits: jnp.ndarray, state: Any) -> jnp.ndarray:
+    """Mask illegal actions in logits for both root and interior mctx nodes."""
+    invalid = _invalid_actions(state).astype(bool)
+    logits = logits - jnp.max(logits, axis=-1, keepdims=True)
+    min_logit = jnp.finfo(logits.dtype).min
+    return jnp.where(invalid, min_logit, logits)
+
+
+def _qtransform_qinit(
+    tree: mctx.Tree,
+    node_index: jnp.ndarray,
+    *,
+    q_trust: float,
+    c_visit: float,
+    c_scale: float,
+) -> jnp.ndarray:
+    """Reference-style completed Q for mctx action selection.
+
+    Prophet's Python search completes an unvisited child with
+    ``q_trust * q_init`` from the parent node's Q-head. mctx's default
+    completion only has scalar V, so the Q-head was not participating in JAX
+    search at all. We carry each node's raw Q-head in the mctx embedding and use
+    it here for unvisited actions; visited actions still use empirical tree Q.
+    """
+    qvalues = tree.qvalues(node_index)
+    visit_counts = tree.children_visits[node_index]
+    q_init = tree.embeddings.q_init[node_index]
+    completed = jnp.where(visit_counts > 0, qvalues, q_trust * q_init)
+    visit_scale = c_visit + jnp.max(visit_counts, axis=-1)
+    return visit_scale * c_scale * completed
 
 
 # --------------------------------------------------------------------------
@@ -127,66 +156,55 @@ def root_fn(params: Any, state: Any) -> mctx.RootFnOutput:
     Runs ``model.forward`` on ``encode_state(state)`` to get
     ``(policy_logits[B,4096], q[B,4096], v[B])`` and returns:
 
-      * ``prior_logits`` = the **RAW** policy logits (mctx wants logits, NOT a
-        softmax — do not normalise them here). Illegal actions are masked out
-        separately via ``invalid_actions`` passed to the policy call, so we keep
-        the full 4096 logit vector untouched.
+      * ``prior_logits`` = policy logits with illegal actions masked out. mctx
+        also receives a root invalid-action mask, but child nodes need their
+        logits pre-masked because mctx has no child invalid-action argument.
       * ``value``        = ``v`` (the network's P(win) - P(loss) scalar in
         ``[-1, 1]`` from the side-to-move's perspective).
-      * ``embedding``    = the pgx ``State`` itself. mctx treats this as an
-        opaque pytree and only threads it through ``recurrent_fn``; it never
-        inspects it.
-
-    The Q-head ``q`` is not a field of ``RootFnOutput`` (mctx has no per-action
-    root value slot); it is seeded into the search via ``recurrent_fn`` (each
-    child's ``value`` is the network value of that child, and the played-move
-    Q-head value is surfaced separately by ``search_result`` for surprise
-    detection). See the module docstring for why exact ``q_init`` first-play
-    seeding is not reproducible under mctx.
+      * ``embedding``    = ``(state, q)``. mctx treats this as an opaque pytree;
+        the custom qtransform reads ``q`` back out for unvisited-action
+        completion.
     """
     x = encode_state(state)  # f32[B, 64, FEATURES]
-    policy_logits, _q, v = model_forward(params, x)
+    policy_logits, q, v = model_forward(params, x)
     return mctx.RootFnOutput(
-        prior_logits=policy_logits,          # RAW logits, [B, 4096]
+        prior_logits=_mask_illegal_logits(policy_logits, state),  # [B, 4096]
         value=v,                             # [B]
-        embedding=state,                     # opaque pgx State pytree
+        embedding=_SearchEmbedding(state=state, q_init=q),  # opaque to mctx
     )
 
 
-def recurrent_fn(params: Any, rng_key: Any, action: jnp.ndarray, state: Any):
+def recurrent_fn(params: Any, rng_key: Any, action: jnp.ndarray, embedding: Any):
     """One simulation step: apply ``action`` to ``state`` and evaluate the child.
 
     ``action`` is a batched prophet action index ``[B]`` (``from*64 + to``).
     Contract (mctx): return ``(RecurrentFnOutput, next_embedding)`` in that
-    order, where ``next_embedding`` is the child pgx ``State``.
+    order, where ``next_embedding`` is the child ``(pgx State, q_head)`` pair.
 
     Field-by-field (all ``[B]`` / ``[B, 4096]``):
 
-      * ``reward``   = 0.0. prophet's reward signal is its *dense Q-head*, but
-        mctx's backup is value-based (it bootstraps from ``value``), so the
-        per-transition reward is zero and the child ``value`` carries the
-        signal. (Prophet's "dense reward" lives in the value/Q targets at train
-        time, not in the MCTS transition reward.)
-      * ``discount`` = ``where(child_terminal, 0.0, 1.0)`` — cut the bootstrap
-        at terminal/absorbing children, matching prophet's terminal handling.
-      * ``prior_logits`` = the child's RAW policy logits.
-      * ``value``    = ``where(child_terminal, terminal_value, child_v)`` — for
-        terminal children we override the network value with the true mate/draw
-        value so the backup uses the real outcome; otherwise the network value.
+      * ``reward``   = terminal outcome in the parent's perspective, else 0.
+      * ``discount`` = ``where(child_terminal, 0.0, -1.0)``. The negative
+        discount is the negamax sign flip for non-terminal children.
+      * ``prior_logits`` = the child's policy logits with illegal actions masked.
+      * ``value``    = ``child_v`` for non-terminals and 0 at terminals because
+        terminal outcomes are carried by ``reward``.
 
     NOTE on sign convention. pgx and prophet both express the child value from
-    the *child's* side-to-move perspective, and mctx itself performs the
-    negamax flip across plies when backing values up the tree. So we return the
-    child value as-is (side-to-move-relative); we do NOT pre-negate it.
-    ``terminal_info`` already returns the side-to-move value at the child
-    (checkmate -> -1.0, draw -> 0.0), which is exactly this convention.
+    the *child's* side-to-move perspective. mctx backs up ``reward + discount *
+    value``; using ``discount = -1`` flips child values into the parent's frame.
+    ``terminal_info`` returns the side-to-move terminal value at the child
+    (checkmate -> -1.0, draw -> 0.0), so ``reward = -terminal_value`` gives a
+    mating move +1 for the parent.
     """
+    state = embedding.state
+
     # action: [B] int32 (prophet index). env_step maps 4096 -> pgx 4672 and
     # steps without auto-reset.
     next_state = env_step(state, action.astype(jnp.int32))
 
     x_child = encode_state(next_state)                 # f32[B, 64, F]
-    child_logits, _child_q, child_v = model_forward(params, x_child)
+    child_logits, child_q, child_v = model_forward(params, x_child)
 
     is_terminal, terminal_value = terminal_info(next_state)  # bool[B], f32[B]
 
@@ -205,10 +223,10 @@ def recurrent_fn(params: Any, rng_key: Any, action: jnp.ndarray, state: Any):
     out = mctx.RecurrentFnOutput(
         reward=reward,                                 # [B] terminal outcome, parent's view
         discount=discount,                             # [B] -1 non-terminal (negamax), 0 terminal
-        prior_logits=child_logits,                     # [B, 4096] RAW logits
+        prior_logits=_mask_illegal_logits(child_logits, next_state),  # [B, 4096]
         value=value,                                   # [B] network value (non-terminal)
     )
-    return out, next_state
+    return out, _SearchEmbedding(state=next_state, q_init=child_q)
 
 
 # --------------------------------------------------------------------------
@@ -220,20 +238,24 @@ def recurrent_fn(params: Any, rng_key: Any, action: jnp.ndarray, state: Any):
 # model.forward per simulation step). So a whole batch of games searches in a
 # single jit boundary, exactly as the spec wants. The Gumbel/qtransform knobs
 # are keyword-only (note the bare ``*`` in the mctx signature); gumbel_scale=1.0
-# + the default qtransform (qtransform_completed_by_mix_value) is the correct
-# Gumbel configuration. num_simulations / max_num_considered_actions are python
-# ints (static to mctx), so we cache one compiled callable per (sims,
-# candidates) pair instead of retracing each call.
+# keeps the reference root exploration. num_simulations / candidates / Q-scale
+# knobs are static to the compiled function, so we cache by all of them.
 #
 # VERIFY: argument names/positions of mctx.gumbel_muzero_policy
 # (params, rng_key, root, recurrent_fn, num_simulations, invalid_actions=...,
 #  *, qtransform=..., max_num_considered_actions=..., gumbel_scale=...).
-# These match the verified mctx/_src/policies.py signature. qtransform is left
-# at its default (qtransform_completed_by_mix_value), the correct Gumbel default.
-_SEARCH_CACHE: dict[tuple[int, int], Any] = {}
+# These match the verified mctx/_src/policies.py signature. We pass a custom
+# qtransform so unvisited children use prophet's Q-head first-play value.
+_SEARCH_CACHE: dict[tuple[int, int, float, float, float], Any] = {}
 
 
-def _make_search_fn(num_simulations: int, max_num_considered_actions: int):
+def _make_search_fn(
+    num_simulations: int,
+    max_num_considered_actions: int,
+    q_trust: float,
+    c_visit: float,
+    c_scale: float,
+):
     """Build a jitted ``(params, key, state) -> PolicyOutput`` search closure.
 
     Closes over the two python-int budgets (static to mctx) so each distinct
@@ -253,18 +275,36 @@ def _make_search_fn(num_simulations: int, max_num_considered_actions: int):
             invalid_actions=invalid,
             max_num_considered_actions=max_num_considered_actions,
             gumbel_scale=1.0,
-            # qtransform -> qtransform_completed_by_mix_value (Gumbel default).
+            qtransform=lambda tree, node_index: _qtransform_qinit(
+                tree,
+                node_index,
+                q_trust=q_trust,
+                c_visit=c_visit,
+                c_scale=c_scale,
+            ),
         )
 
     return jax.jit(_search)
 
 
-def _get_search_fn(num_simulations: int, max_num_considered_actions: int):
-    """Memoised :func:`_make_search_fn`, keyed by the (sims, candidates) ints."""
-    key = (int(num_simulations), int(max_num_considered_actions))
+def _get_search_fn(
+    num_simulations: int,
+    max_num_considered_actions: int,
+    q_trust: float,
+    c_visit: float,
+    c_scale: float,
+):
+    """Memoised :func:`_make_search_fn`, keyed by static search knobs."""
+    key = (
+        int(num_simulations),
+        int(max_num_considered_actions),
+        float(q_trust),
+        float(c_visit),
+        float(c_scale),
+    )
     fn = _SEARCH_CACHE.get(key)
     if fn is None:
-        fn = _make_search_fn(key[0], key[1])
+        fn = _make_search_fn(key[0], key[1], key[2], key[3], key[4])
         _SEARCH_CACHE[key] = fn
     return fn
 
@@ -281,7 +321,13 @@ def run_search(params: Any, key: Any, state: Any, cfg: SearchConfig) -> mctx.Pol
     and the Gumbel top-k / sequential-halving selection) runs inside one
     ``jax.jit`` boundary, so the whole batch searches in a single compiled call.
     """
-    search_fn = _get_search_fn(cfg.sims, cfg.root_candidates)
+    search_fn = _get_search_fn(
+        cfg.sims,
+        cfg.root_candidates,
+        cfg.q_trust,
+        cfg.c_visit,
+        cfg.c_scale,
+    )
     return search_fn(params, key, state)
 
 
@@ -292,7 +338,13 @@ def deep_search(params: Any, key: Any, state: Any, cfg: SearchConfig) -> mctx.Po
     """
     deep_sims = getattr(cfg, "deep_sims", 128)
     deep_candidates = getattr(cfg, "deep_candidates", 16)
-    search_fn = _get_search_fn(deep_sims, deep_candidates)
+    search_fn = _get_search_fn(
+        deep_sims,
+        deep_candidates,
+        cfg.q_trust,
+        cfg.c_visit,
+        cfg.c_scale,
+    )
     return search_fn(params, key, state)
 
 

@@ -19,6 +19,23 @@ self-play ~50-90× faster. Stack: **flax** (model) + **pgx** (chess env) +
 PyTorch run is **71-100% decisive** at the same early stage. With no wins/losses,
 the value & Q heads can't learn to *win* — only the policy head trains.
 
+### 2026-06-24 Codex fix update
+- Fixed the remaining search corruption path: mctx only applies
+  `invalid_actions` at the root, so JAX interior simulations were free to pick
+  illegal chess actions. Those illegal actions went through the `env_step`
+  guard/clamp and could inject fake terminal rewards into root Q targets.
+  `search.py` now masks policy logits at every expanded node.
+- Wired the Q-head back into search. Each mctx node embedding now carries that
+  node's raw per-action Q-head vector, and the custom qtransform completes
+  unvisited actions with `q_trust * q_init` instead of mctx's scalar-V mixed
+  value. `q_trust`, `c_visit`, and `c_scale` are now live search knobs.
+- Restored PyTorch-reference truncation semantics: a self-play ply cap is
+  unknown (`z_white = NaN`, `result = -1`), not a fake draw. The replay rows are
+  still kept, but outcome blending/WDL supervision are skipped for those games.
+- Local CPU validation passed: `python -m prophet_jax.smoke_test`, a mate-in-1
+  search probe at full candidate coverage, no nonzero fake rewards on visited
+  start-position edges, and a tiny `prophet_jax.train` run.
+
 ### Root cause = wrong sign/convention in the **mctx two-player search**, partly fixed:
 1. **FIXED — negamax discount.** `search.py recurrent_fn` returned
    `discount = +1` for non-terminal children; a two-player zero-sum game needs
