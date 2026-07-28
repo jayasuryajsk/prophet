@@ -28,9 +28,25 @@ import requests
 
 import numpy as _np
 
-from prophet.fastboard import PyChessBoard
 from prophet.model import load_checkpoint
-from prophet.searchB import BatchedSearcher
+from prophet.searchC import RustBatchedSearcher
+
+_DEV = ("mps" if torch.backends.mps.is_available()
+        else "cuda" if torch.cuda.is_available() else "cpu")
+_BATCH = 96 if _DEV != "cpu" else 32
+
+
+class _DevEval:
+    """Model wrapper: batched eval on the accelerator, results to CPU."""
+
+    def __init__(self, m, dev):
+        self.m = m.to(dev)
+        self.dev = dev
+
+    def __call__(self, x):
+        with torch.no_grad():
+            l, a, v = self.m(x.to(self.dev))
+        return l.cpu(), a.cpu(), v.cpu()
 
 API = "https://lichess.org"
 _lock = threading.Lock()  # one search at a time (shared CPU)
@@ -68,7 +84,7 @@ class Game(threading.Thread):
         if my_ms < 15_000:  # panic mode
             t = min(t, 1.0)
         b = int(self.bot.nps * t)
-        return int(np.clip(b, 48, 2048))
+        return int(np.clip(b, 64, 8192))
 
     def run(self):
         bot = self.bot
@@ -99,14 +115,12 @@ class Game(threading.Thread):
                 inc_ms = state["winc"] if my_color == chess.WHITE else state["binc"]
                 with _lock:
                     b = self.budget(my_ms, inc_ms, board)
-                    # Phase B batched-leaf search: same recipe as the proven
-                    # baseline, leaves evaluated 16-at-a-time (2.5x deeper
-                    # per second at identical semantics)
-                    s = BatchedSearcher(bot.model, budget=max(48, b), batch=16,
-                                        seed=int(rng.integers(1 << 30)))
-                    pb = PyChessBoard(board)
-                    action, _spent = s.search(pb)
-                    mv = pb.move_for(action)
+                    # Phase C: Rust tree + accelerator-batched evals — same
+                    # recipe semantics, ~12x the sequential throughput
+                    s = RustBatchedSearcher(bot.model, budget=max(64, b),
+                                            batch=_BATCH,
+                                            seed=int(rng.integers(1 << 30)))
+                    mv, _spent = s.search(board)
                 uci = mv.uci()
                 for attempt in range(3):
                     resp = requests.post(
@@ -128,14 +142,15 @@ class Bot:
     def __init__(self, token, ckpt):
         self.token = token
         self.ckpt_path = ckpt
-        self.model = load_checkpoint(ckpt)
-        self.model.eval()
-        torch.set_num_threads(4)
-        # measure EFFECTIVE nps with the batched search itself
+        raw = load_checkpoint(ckpt)
+        raw.eval()
+        torch.set_num_threads(8)
+        self.model = _DevEval(raw, _DEV) if _DEV != "cpu" else raw
+        # measure EFFECTIVE nps with the real search (Rust tree + batching)
         import chess as _c
-        s = BatchedSearcher(self.model, budget=256, batch=16, seed=1)
+        s = RustBatchedSearcher(self.model, budget=512, batch=_BATCH, seed=1)
         t0 = time.time()
-        _, spent = s.search(PyChessBoard(_c.Board()))
+        _, spent = s.search(_c.Board())
         self.nps = spent / max(0.05, time.time() - t0)
         self.active = set()
         me = requests.get(f"{API}/api/account", headers=_headers(token), timeout=15).json()
