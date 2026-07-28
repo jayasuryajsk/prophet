@@ -20,6 +20,9 @@ GAMES="${GAMES:-1000000}"
 OUT="${OUT:-/workspace/runs/fast_v3}"
 THREADS="${THREADS:-48}"
 MEGA="${MEGA:-1024}"
+WORKERS="${WORKERS:-1}"   # fast worker PROCESSES (one GIL each; >1 when the
+                          # glue lane, not the GPU, is the bottleneck)
+RESUME="${RESUME:-}"      # path to full_resume.pt for a warm restart
 
 mkdir -p "$OUT"
 cd "$(dirname "$0")/.."
@@ -27,7 +30,8 @@ cd "$(dirname "$0")/.."
 nohup python3 scripts/train_loop.py \
   --games "$GAMES" \
   --fast --fast-threads "$THREADS" --mega-batch "$MEGA" --search-batch 32 \
-  --workers 1 --worker-device cuda --device cuda \
+  --workers "$WORKERS" --worker-device cuda --device cuda \
+  ${RESUME:+--resume-full "$RESUME"} \
   --d-model 320 --n-layers 8 --n-heads 8 \
   --sims 32 --candidates 8 \
   --pcr-prob 0.25 --pcr-cheap-sims 12 \
