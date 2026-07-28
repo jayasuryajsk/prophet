@@ -145,7 +145,10 @@ class Bot:
         raw = load_checkpoint(ckpt)
         raw.eval()
         torch.set_num_threads(8)
-        self.model = _DevEval(raw, _DEV) if _DEV != "cpu" else raw
+        try:
+            self.model = _DevEval(raw, _DEV) if _DEV != "cpu" else raw
+        except Exception:  # e.g. exclusive-mode GPU on shared pods
+            self.model = raw
         # measure EFFECTIVE nps with the real search (Rust tree + batching)
         import chess as _c
         s = RustBatchedSearcher(self.model, budget=512, batch=_BATCH, seed=1)
@@ -166,7 +169,7 @@ class Bot:
         tc = ch["timeControl"]
         if tc["type"] != "clock" or tc["limit"] < 60:
             return False
-        if len(self.active) >= 2:
+        if len(self.active) >= 1:
             return False
         return True
 
