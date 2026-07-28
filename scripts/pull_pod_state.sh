@@ -17,11 +17,13 @@ while true; do
   scp -q -P "$PORT" "root@$HOST:$REMOTE/train.log" "$LOCAL/" 2>/dev/null || true
   scp -q -P "$PORT" "root@$HOST:$REMOTE/study_telemetry.log" "$LOCAL/" 2>/dev/null || true
   scp -q -P "$PORT" "root@$HOST:$REMOTE/broker_stats.log" "$LOCAL/" 2>/dev/null || true
-  # newest milestone ckpts (cheap, 39MB each)
+  # newest milestone ckpts (39MB each) — keep only 2 locally so the mirror
+  # stays ~5GB total (full_resume 4.3GB + 2 ckpts + logs), never growing
   for f in $(ssh -p "$PORT" "root@$HOST" "ls -t $REMOTE/ckpt_*.pt 2>/dev/null | head -2" 2>/dev/null); do
     b="$(basename "$f")"
     [ -f "$LOCAL/$b" ] || scp -q -P "$PORT" "root@$HOST:$f" "$LOCAL/" || true
   done
+  ls -t "$LOCAL"/ckpt_*.pt 2>/dev/null | tail -n +3 | xargs rm -f 2>/dev/null || true
   # full resume state (optimizer+buffer, ~4GB) — only when its mtime changed
   rts="$(ssh -p "$PORT" "root@$HOST" "stat -c %Y $REMOTE/full_resume.pt 2>/dev/null" 2>/dev/null || echo 0)"
   lts="$(cat "$LOCAL/.full_resume.mtime" 2>/dev/null || echo -1)"
