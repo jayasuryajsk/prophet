@@ -129,12 +129,11 @@ def train_step(model, optimizer, batch, weights: LossWeights | None = None):
     loss.backward()
     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     optimizer.step()
-    return {
-        "loss": loss.item(),
-        "policy": loss_pi.item(),
-        "value": loss_v.item(),
-        "q": loss_q.item(),
-        "consistency": loss_cons.item(),
-        "wdl": loss_wdl.item(),
-        "mlh": loss_mlh.item(),
-    }
+    # one packed D2H sync instead of seven .item() round-trips
+    vals = torch.stack(
+        [loss.detach(), loss_pi.detach(), loss_v.detach(), loss_q.detach(),
+         loss_cons.detach(), loss_wdl.detach(), loss_mlh.detach()]
+    ).float().cpu().tolist()
+    return dict(zip(
+        ("loss", "policy", "value", "q", "consistency", "wdl", "mlh"), vals
+    ))
