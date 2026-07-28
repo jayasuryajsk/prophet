@@ -28,6 +28,7 @@ import requests
 
 import numpy as _np
 
+from prophet.fasteval import FastEval
 from prophet.model import load_checkpoint
 from prophet.search import SearchConfig, search_move
 
@@ -124,10 +125,11 @@ class Bot:
     def __init__(self, token, ckpt):
         self.token = token
         self.ckpt_path = ckpt
-        self.model = load_checkpoint(ckpt)
+        self.model = FastEval(load_checkpoint(ckpt))  # quant + transposition cache
         self.model.eval()
         torch.set_num_threads(4)
-        self.nps = measure_nps(self.model)
+        # clock the bare net (cache would lie), then credit the cache ~1.5x
+        self.nps = measure_nps(self.model.m) * 1.5
         self.active = set()
         me = requests.get(f"{API}/api/account", headers=_headers(token), timeout=15).json()
         self.me = me["id"]
