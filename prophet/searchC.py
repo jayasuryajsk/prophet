@@ -1,16 +1,45 @@
 """Phase C driver: the search tree lives in Rust (prophet_core.BatchSearch);
 Python only evaluates position batches with the net. Same recipe semantics
 as search.py / searchB.py.
+
+The GAME HISTORY is replayed into the Rust tree (base fen + action list),
+not just the root FEN: repetition detection, the last-two-moves planes and
+the parity plane all live in the history. A bare-FEN tree is blind to
+threefold draws (it cost two won live games) and feeds the net skewed
+features.
 """
 
+import chess
 import numpy as np
 import torch
 
 import prophet_core
 
+from .encoding import move_to_index
 from .fastboard import PyChessBoard
 
 F = 24
+
+
+def board_history(board: chess.Board):
+    """(base_fen, action list) reconstructing `board` from its move stack.
+    Underpromotions can't round-trip through the 4096 action space, so the
+    history restarts just after the most recent one (repetition can't span
+    an irreversible move anyway — every promotion resets the fifty-move
+    clock, so no legal repetition reaches back past it)."""
+    stack = list(board.move_stack)
+    tmp = board.root()
+    base_fen = tmp.fen()
+    actions = []
+    for mv in stack:
+        if mv.promotion is not None and mv.promotion != chess.QUEEN:
+            tmp.push(mv)
+            base_fen = tmp.fen()
+            actions = []
+            continue
+        actions.append(move_to_index(mv, tmp.turn == chess.BLACK))
+        tmp.push(mv)
+    return base_fen, actions
 
 
 class RustBatchedSearcher:
@@ -31,8 +60,9 @@ class RustBatchedSearcher:
     def search(self, board):
         """board: python-chess Board. Returns (chess.Move, spent)."""
         budget, batch, candidates, cp, cv, cs, qt, ct, seed = self.args
-        t = prophet_core.BatchSearch(board.fen(), budget, batch, candidates,
-                                     cp, cv, cs, qt, ct, seed)
+        base_fen, hist = board_history(board)
+        t = prophet_core.BatchSearch(base_fen, budget, batch, candidates,
+                                     cp, cv, cs, qt, ct, seed, history=hist)
         x = np.asarray(t.root_features(), dtype=np.float32).reshape(1, 64, F)
         lb, ab, vb = self._eval(x)
         t.set_root(lb, ab, np.frombuffer(vb, dtype="<f4")[0].item())

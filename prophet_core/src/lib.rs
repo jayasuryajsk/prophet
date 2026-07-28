@@ -636,10 +636,22 @@ impl BatchSearch {
 impl BatchSearch {
     #[new]
     #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (fen, budget, batch, candidates, c_puct, c_visit, c_scale,
+                        q_trust, contempt, seed, history=None))]
     fn new(fen: &str, budget: u32, batch: usize, candidates: usize, c_puct: f32,
-           c_visit: f32, c_scale: f32, q_trust: f32, contempt: f32, seed: u64)
+           c_visit: f32, c_scale: f32, q_trust: f32, contempt: f32, seed: u64,
+           history: Option<Vec<u16>>)
            -> PyResult<Self> {
-        let board = Board::from_fen(fen)?;
+        // With `history`, `fen` is the BASE position (usually game start) and
+        // the actions are replayed on top: the search root then carries the
+        // real game state — repetition hashes, last-two-moves planes, parity —
+        // instead of the amnesiac state a bare FEN gives. A search that can't
+        // see prior occurrences can't see threefold draws coming (this
+        // exact blindness turned two won live games into repetition draws).
+        let mut board = Board::from_fen(fen)?;
+        for a in history.unwrap_or_default() {
+            board.push_action(a)?;
+        }
         Ok(BatchSearch {
             board,
             nodes: vec![SNode::leaf(0.0, 0.0, 0.0)],

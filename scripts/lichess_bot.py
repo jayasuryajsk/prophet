@@ -1,9 +1,9 @@
 """Prophet on Lichess — direct Bot API bridge.
 
-Streams events, accepts standard challenges, plays with Searcher35
-(tree reuse across moves — its natural habitat at live time controls),
-budgets forwards from the clock, hot-swaps to newer checkpoints between
-games if a newer ckpt file appears.
+Streams events, accepts standard challenges, plays with the Phase C Rust
+batched searcher (searchC), budgets forwards from the clock. The game
+board is rebuilt from the full move list every turn, so searchC replays
+real history into the search tree (repetition awareness lives there).
 
 usage:
   LICHESS_TOKEN=xxx python3 scripts/lichess_bot.py CKPT [--upgrade]
@@ -150,9 +150,12 @@ class Bot:
             self.model = _DevEval(raw, _DEV) if _DEV != "cpu" else raw
         except Exception:  # e.g. exclusive-mode GPU on shared pods
             self.model = raw
-        # measure EFFECTIVE nps with the real search (Rust tree + batching)
+        # measure EFFECTIVE nps with the real search (Rust tree + batching).
+        # Warm up first: the first MPS/CUDA forwards compile kernels, and a
+        # cold probe under-reports ~30% -> every move gets under-budgeted.
         import chess as _c
-        s = RustBatchedSearcher(self.model, budget=512, batch=_BATCH, seed=1)
+        RustBatchedSearcher(self.model, budget=256, batch=_BATCH, seed=1).search(_c.Board())
+        s = RustBatchedSearcher(self.model, budget=512, batch=_BATCH, seed=2)
         t0 = time.time()
         _, spent = s.search(_c.Board())
         self.nps = spent / max(0.05, time.time() - t0)

@@ -159,14 +159,21 @@ def _packed_to_bytes(arr):
     return lg, ad, vs
 
 
-def rust_search(fen: str, cfg: SearchConfig, rng, eval_fn, batch=32) -> SearchResult:
+def rust_search(fen: str, cfg: SearchConfig, rng, eval_fn, batch=32,
+                history=None) -> SearchResult:
     """Run one Gumbel search in Rust; eval_fn(x[n,64,F]) -> packed [n,8193].
     budget = sims+1 so post-root playouts exactly match the python search's
-    cfg.sims (the Rust tree counts the root eval as spent)."""
+    cfg.sims (the Rust tree counts the root eval as spent).
+
+    `history` (action list replayed from `fen`) gives the search root the
+    real game state — repetition hashes, last-two-moves planes, parity —
+    matching what the python search saw on the live game board. Bare-FEN
+    searches (study re-analysis) keep v3's zeroed-history semantics."""
     seed = int(rng.integers(1, 1 << 62))
     t = prophet_core.BatchSearch(
         fen, cfg.sims + 1, min(batch, max(1, cfg.sims)), cfg.root_candidates,
         cfg.c_puct, cfg.c_visit, cfg.c_scale, cfg.q_trust, cfg.contempt, seed,
+        history=list(history) if history else None,
     )
     x = np.asarray(t.root_features(), dtype=np.float32).reshape(1, 64, FEATURES)
     lg, ad, vs = _packed_to_bytes(eval_fn(x))
@@ -213,6 +220,8 @@ def play_game_fast(
     batch: int = 32,
 ) -> GameRecord:
     board = new_board()
+    start_fen = board.fen()
+    played = []  # actions since game start -> search-root history
     raw = []  # (x, search result, child features, mover_was_white, full_search)
     fens = []
     resign_active = resign_enabled and rng.random() >= cfg.resign_off_prob
@@ -233,8 +242,10 @@ def play_game_fast(
         fens.append(board.fen())
         x = board.encode()
         full = cheap_cfg is None or rng.random() < cfg.pcr_prob
-        res = rust_search(fens[-1], search_cfg if full else cheap_cfg, rng, eval_fn, batch)
+        res = rust_search(start_fen, search_cfg if full else cheap_cfg, rng,
+                          eval_fn, batch, history=played)
         board.push_action(res.move_index)
+        played.append(res.move_index)
         child_x = board.encode()
         raw.append((x, res, child_x, mover_white, full))
 
@@ -307,10 +318,12 @@ def play_game_fast(
     )
 
 
-def _play_branch_fast(board, scfg, cfg: StudyConfig, rng, eval_fn, batch):
+def _play_branch_fast(board, base_fen, line, scfg, cfg: StudyConfig, rng, eval_fn, batch):
+    """`board` is base_fen advanced by `line`; both walk forward together so
+    branch searches see the branch's own repetition/move history."""
     raw = []
     while board.terminal_value() is None and len(raw) < cfg.branch_plies:
-        res = rust_search(board.fen(), scfg, rng, eval_fn, batch)
+        res = rust_search(base_fen, scfg, rng, eval_fn, batch, history=line)
         raw.append(
             (
                 _sample_from_search(board, res, res.root_value, cfg.branch_weight),
@@ -318,6 +331,7 @@ def _play_branch_fast(board, scfg, cfg: StudyConfig, rng, eval_fn, batch):
             )
         )
         board.push_action(res.move_index)
+        line.append(res.move_index)
     term = board.terminal_value()
     if term is not None:
         if term == -1.0:
@@ -359,7 +373,8 @@ def study_game_fast(
         for mv_idx in _top_line_indices(res, cfg.n_lines):
             branch_board = board_from_fen(record.fens[t])
             branch_board.push_action(int(mv_idx))
-            out.extend(_play_branch_fast(branch_board, scfg, bcfg, rng, eval_fn, batch))
+            out.extend(_play_branch_fast(branch_board, record.fens[t], [int(mv_idx)],
+                                         scfg, bcfg, rng, eval_fn, batch))
             n_br += 1
             n_term += branch_board.terminal_value() is not None
         if telem:
