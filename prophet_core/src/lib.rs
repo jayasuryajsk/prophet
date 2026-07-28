@@ -151,6 +151,8 @@ impl Board {
         let next = self.cur().clone().play(&mv).map_err(|e| {
             pyo3::exceptions::PyValueError::new_err(format!("play error: {e}"))
         })?;
+        // (kept fallible for the Python-facing API; search paths use known-legal
+        // actions and ignore the Result)
         let h = Board::hash_of(&next);
         self.stack.push(next);
         self.moves.push(mv);
@@ -270,6 +272,7 @@ const NUM_ACTIONS: usize = 4096;
 struct SNode {
     prior: f32,
     q_init: f32,
+    q_raw: f32, // dueling-composed q BEFORE q_trust (training's q_head signal)
     visits: u32,
     total: f32,
     vloss: u32,
@@ -279,10 +282,11 @@ struct SNode {
 }
 
 impl SNode {
-    fn leaf(prior: f32, q_init: f32) -> Self {
+    fn leaf(prior: f32, q_init: f32, q_raw: f32) -> Self {
         SNode {
             prior,
             q_init,
+            q_raw,
             visits: 0,
             total: 0.0,
             vloss: 0,
@@ -347,6 +351,11 @@ pub struct BatchSearch {
     phase_spent: u32,
     pending: Vec<Pending>,
     finished: bool,
+    rr_cursor: usize, // round-robin arm cursor, persists across collect calls
+    // training-stats retention
+    root_legal: Vec<u16>,
+    root_logits_legal: Vec<f32>,
+    root_v_net: f32,
 }
 
 impl BatchSearch {
@@ -377,9 +386,8 @@ impl BatchSearch {
     fn expand_node(&mut self, node_idx: u32, legal: &[u16], logits: &[f32], adv: &[f32], v: f32) {
         let table = Self::dueling_table(v, legal, logits, adv);
         let start = self.nodes.len() as u32;
-        for ((&a, &(p, q)), _) in legal.iter().zip(table.iter()).zip(0..) {
-            let _ = a;
-            self.nodes.push(SNode::leaf(p, self.q_trust * q));
+        for (_a, &(p, q)) in legal.iter().zip(table.iter()) {
+            self.nodes.push(SNode::leaf(p, self.q_trust * q, q));
         }
         let cstart = self.child_actions.len() as u32;
         for (k, &a) in legal.iter().enumerate() {
@@ -523,99 +531,42 @@ impl BatchSearch {
             actions.push(a);
         }
     }
-}
 
-#[pymethods]
-impl BatchSearch {
-    #[new]
-    #[allow(clippy::too_many_arguments)]
-    fn new(fen: &str, budget: u32, batch: usize, candidates: usize, c_puct: f32,
-           c_visit: f32, c_scale: f32, q_trust: f32, contempt: f32, seed: u64)
-           -> PyResult<Self> {
-        let board = Board::from_fen(fen)?;
-        Ok(BatchSearch {
-            board,
-            nodes: vec![SNode::leaf(0.0, 0.0)],
-            child_actions: vec![],
-            child_nodes: vec![],
-            budget: budget.max(2),
-            batch: batch.max(1),
-            candidates: candidates.max(1),
-            c_puct,
-            c_visit,
-            c_scale,
-            q_trust,
-            contempt,
-            rng: XorShift(seed | 1),
-            base: vec![],
-            remaining: vec![],
-            spent: 0,
-            per_phase: 1,
-            phase_spent: 0,
-            pending: vec![],
-            finished: false,
-        })
-    }
-
-    fn root_features(&self) -> Vec<f32> {
-        self.board.encode()
-    }
-
-    fn set_root(&mut self, logits: &[u8], adv: &[u8], v: f32) {
-        let lg = bytes_to_f32(logits);
-        let ad = bytes_to_f32(adv);
-        let legal = self.board.legal_actions();
-        self.expand_node(0, &legal, &lg, &ad, v);
-        self.nodes[0].visits = 1;
-        let mut base: Vec<(u16, f64)> = legal
-            .iter()
-            .map(|&a| (a, lg[a as usize] as f64 + self.rng.gumbel()))
-            .collect();
-        base.sort_by(|x, y| y.1.partial_cmp(&x.1).unwrap());
-        let m = self.candidates.min(base.len());
-        self.remaining = base.iter().take(m).map(|(a, _)| *a).collect();
-        self.base = base;
-        self.spent = 1;
-        let phases = if m > 1 { (m as f32).log2().ceil() as u32 } else { 1 };
-        self.per_phase = ((self.budget - 1) / phases.max(1)).max(1);
-        self.phase_spent = 0;
-    }
-
-    /// Collect the next batch; returns flattened features (empty = done).
-    fn collect(&mut self, py: Python<'_>) -> PyObject {
-        use pyo3::types::PyBytes;
+    // Heavy bodies of collect/apply, GIL-free (called via py.allow_threads so
+    // many worker threads can run their trees truly in parallel).
+    fn collect_inner(&mut self) -> Vec<u8> {
         self.pending.clear();
         if self.finished || self.spent >= self.budget || self.remaining.is_empty() {
             self.finished = true;
-            return PyBytes::new(py, &[]).into();
+            return Vec::new();
         }
         let want = self
             .batch
             .min((self.budget - self.spent) as usize)
             .min((self.per_phase.saturating_sub(self.phase_spent)).max(1) as usize);
-        let per = (want / self.remaining.len()).max(1);
         let mut feats: Vec<f32> = Vec::with_capacity(want * 64 * FEATURES);
         let terminals_before = self.spent;
         let rem = self.remaining.clone();
-        'outer: for &a in rem.iter() {
-            for _ in 0..per {
-                if self.pending.len() >= want {
-                    break 'outer;
+        // Round-robin over the remaining arms with a PERSISTENT cursor, so
+        // sims spread uniformly across candidates no matter how `want`
+        // relates to the arm count (a loop restarting at arm 0 each call
+        // starves the tail arms whenever want < len(rem) — at batch=1 it
+        // starves every arm but the first).
+        let mut tries = 0;
+        while self.pending.len() < want && self.spent < self.budget && tries < 4 * want + 8 {
+            let a = rem[self.rr_cursor % rem.len()];
+            self.rr_cursor = self.rr_cursor.wrapping_add(1);
+            tries += 1;
+            if let Some(p) = self.collect_one(a) {
+                // encode leaf: replay path
+                for &act in p.actions.iter() {
+                    let _ = self.board.push_action(act);
                 }
-                if let Some(p) = self.collect_one(a) {
-                    // encode leaf: replay path
-                    for &act in p.actions.iter() {
-                        let _ = self.board.push_action(act);
-                    }
-                    feats.extend(self.board.encode());
-                    for _ in 0..p.actions.len() {
-                        self.board.pop();
-                    }
-                    self.pending.push(p);
+                feats.extend(self.board.encode());
+                for _ in 0..p.actions.len() {
+                    self.board.pop();
                 }
-                if self.spent >= self.budget {
-                    break 'outer;
-                }
+                self.pending.push(p);
             }
         }
         if self.pending.is_empty() {
@@ -626,17 +577,12 @@ impl BatchSearch {
             if self.phase_spent >= self.per_phase {
                 self.halve();
             }
-            return PyBytes::new(py, &[]).into();
+            return Vec::new();
         }
-        let bytes: Vec<u8> = feats.iter().flat_map(|f| f.to_le_bytes()).collect();
-        PyBytes::new(py, &bytes).into()
+        feats.iter().flat_map(|f| f.to_le_bytes()).collect()
     }
 
-    fn n_pending(&self) -> usize {
-        self.pending.len()
-    }
-
-    fn apply(&mut self, logits: &[u8], adv: &[u8], values: &[u8]) {
+    fn apply_inner(&mut self, logits: &[u8], adv: &[u8], values: &[u8]) {
         let lg = bytes_to_f32(logits);
         let ad = bytes_to_f32(adv);
         let vs = bytes_to_f32(values);
@@ -656,13 +602,93 @@ impl BatchSearch {
         if self.phase_spent >= self.per_phase {
             self.halve();
         }
-        if self.spent >= self.budget || self.remaining.len() <= 1 {
-            // let the final selection read current stats; mark done when the
-            // last phase's budget is consumed
-            if self.spent >= self.budget {
-                self.finished = true;
-            }
+        if self.spent >= self.budget {
+            self.finished = true;
         }
+    }
+
+    fn set_root_inner(&mut self, logits: &[u8], adv: &[u8], v: f32) {
+        let lg = bytes_to_f32(logits);
+        let ad = bytes_to_f32(adv);
+        let legal = self.board.legal_actions();
+        self.expand_node(0, &legal, &lg, &ad, v);
+        self.nodes[0].visits = 1;
+        // retain for training-target export
+        self.root_logits_legal = legal.iter().map(|&a| lg[a as usize]).collect();
+        self.root_legal = legal.clone();
+        self.root_v_net = v;
+        let mut base: Vec<(u16, f64)> = legal
+            .iter()
+            .map(|&a| (a, lg[a as usize] as f64 + self.rng.gumbel()))
+            .collect();
+        base.sort_by(|x, y| y.1.partial_cmp(&x.1).unwrap());
+        let m = self.candidates.min(base.len());
+        self.remaining = base.iter().take(m).map(|(a, _)| *a).collect();
+        self.base = base;
+        self.spent = 1;
+        let phases = if m > 1 { (m as f32).log2().ceil() as u32 } else { 1 };
+        self.per_phase = ((self.budget - 1) / phases.max(1)).max(1);
+        self.phase_spent = 0;
+    }
+}
+
+#[pymethods]
+impl BatchSearch {
+    #[new]
+    #[allow(clippy::too_many_arguments)]
+    fn new(fen: &str, budget: u32, batch: usize, candidates: usize, c_puct: f32,
+           c_visit: f32, c_scale: f32, q_trust: f32, contempt: f32, seed: u64)
+           -> PyResult<Self> {
+        let board = Board::from_fen(fen)?;
+        Ok(BatchSearch {
+            board,
+            nodes: vec![SNode::leaf(0.0, 0.0, 0.0)],
+            child_actions: vec![],
+            child_nodes: vec![],
+            budget: budget.max(2),
+            batch: batch.max(1),
+            candidates: candidates.max(1),
+            c_puct,
+            c_visit,
+            c_scale,
+            q_trust,
+            contempt,
+            rng: XorShift(seed | 1),
+            base: vec![],
+            remaining: vec![],
+            spent: 0,
+            per_phase: 1,
+            phase_spent: 0,
+            pending: vec![],
+            finished: false,
+            rr_cursor: 0,
+            root_legal: vec![],
+            root_logits_legal: vec![],
+            root_v_net: 0.0,
+        })
+    }
+
+    fn root_features(&self) -> Vec<f32> {
+        self.board.encode()
+    }
+
+    fn set_root(&mut self, py: Python<'_>, logits: &[u8], adv: &[u8], v: f32) {
+        py.allow_threads(|| self.set_root_inner(logits, adv, v));
+    }
+
+    /// Collect the next batch; returns flattened features (empty = done).
+    fn collect(&mut self, py: Python<'_>) -> PyObject {
+        use pyo3::types::PyBytes;
+        let bytes = py.allow_threads(|| self.collect_inner());
+        PyBytes::new(py, &bytes).into()
+    }
+
+    fn n_pending(&self) -> usize {
+        self.pending.len()
+    }
+
+    fn apply(&mut self, py: Python<'_>, logits: &[u8], adv: &[u8], values: &[u8]) {
+        py.allow_threads(|| self.apply_inner(logits, adv, values));
     }
 
     fn done(&self) -> bool {
@@ -696,6 +722,85 @@ impl BatchSearch {
             }
         }
         best
+    }
+
+    // ---- training-stats exports (Rust-max pipeline) ----
+
+    /// Improved policy target: (actions, probs) = softmax over legal of
+    /// (root logit + sig * completedQ). Mirrors search.py's policy target.
+    fn policy_target(&self) -> (Vec<u16>, Vec<f32>) {
+        let sig = (self.c_visit + self.max_root_child_visits() as f32) * self.c_scale;
+        let mut scores: Vec<f32> = self
+            .root_legal
+            .iter()
+            .zip(self.root_logits_legal.iter())
+            .map(|(&a, &l)| l + sig * self.completed_q(a))
+            .collect();
+        let mx = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let mut sum = 0.0f32;
+        for x in scores.iter_mut() {
+            *x = (*x - mx).exp();
+            sum += *x;
+        }
+        for x in scores.iter_mut() {
+            *x /= sum;
+        }
+        (self.root_legal.clone(), scores)
+    }
+
+    /// Root children that got visits: (actions, empirical q from the root
+    /// player's perspective, visit counts). Q-head targets.
+    fn visited_children(&self) -> (Vec<u16>, Vec<f32>, Vec<u32>) {
+        let n = &self.nodes[0];
+        let mut acts = Vec::new();
+        let mut qs = Vec::new();
+        let mut vis = Vec::new();
+        for k in 0..n.child_len as usize {
+            let a = self.child_actions[n.child_start as usize + k];
+            let c = &self.nodes[self.child_nodes[n.child_start as usize + k] as usize];
+            if c.visits > 0 {
+                acts.push(a);
+                qs.push(-(c.total / c.visits as f32));
+                vis.push(c.visits);
+            }
+        }
+        (acts, qs, vis)
+    }
+
+    /// Search-blended root value: (v_net + n * q_avg) / (1 + n), where n is
+    /// total root-child visits and q_avg their visit-weighted mean q.
+    fn root_value(&self) -> f32 {
+        let n = &self.nodes[0];
+        let mut tot = 0.0f32;
+        let mut cnt = 0u32;
+        for k in 0..n.child_len as usize {
+            let c = &self.nodes[self.child_nodes[n.child_start as usize + k] as usize];
+            if c.visits > 0 {
+                tot += -c.total; // child perspective -> root perspective
+                cnt += c.visits;
+            }
+        }
+        if cnt == 0 {
+            return self.root_v_net;
+        }
+        (self.root_v_net + tot) / (1.0 + cnt as f32)
+    }
+
+    /// Net's raw root value (pre-search).
+    fn net_v(&self) -> f32 {
+        self.root_v_net
+    }
+
+    /// Raw dueling-composed q (pre-q_trust) of a root action — the q-head's
+    /// own opinion of the move, used as q_head_played in training records.
+    fn root_q_raw(&self, action: u16) -> f32 {
+        let n = &self.nodes[0];
+        for k in 0..n.child_len as usize {
+            if self.child_actions[n.child_start as usize + k] == action {
+                return self.nodes[self.child_nodes[n.child_start as usize + k] as usize].q_raw;
+            }
+        }
+        0.0
     }
 }
 

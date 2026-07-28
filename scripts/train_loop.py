@@ -125,6 +125,12 @@ def main():
     ap.add_argument("--ema", type=float, default=0.999, help="weight EMA decay; checkpoints/evals use the EMA")
     ap.add_argument("--schedule", action="store_true", help="game-count curricula for study/q-trust/q-loss (moonshot)")
     ap.add_argument("--compile", action="store_true", help="torch.compile worker inference (CUDA only)")
+    ap.add_argument("--fast", action="store_true",
+                    help="Rust-max workers: threaded games on Rust search trees, "
+                    "one mega-batch eval broker per worker (see prophet/fastplay.py)")
+    ap.add_argument("--fast-threads", type=int, default=16, help="game threads per fast worker")
+    ap.add_argument("--mega-batch", type=int, default=512, help="fast worker: max positions per GPU forward")
+    ap.add_argument("--search-batch", type=int, default=32, help="fast worker: leaves per tree collect")
     ap.add_argument("--no-eval", action="store_true", help="skip in-loop vs-random eval (still saves milestone checkpoints); use the gauntlet instead")
     args = ap.parse_args()
 
@@ -207,31 +213,57 @@ def main():
     # worker on put() (maxsize 64 fills in seconds once worker count is high).
     game_q = ctx.Queue(maxsize=max(256, 32 * len(layout)))
     stop = ctx.Event()
-    workers = [
-        ctx.Process(
-            target=vector_worker,
-            args=(
-                i, str(ckpt_path), str(gate_path), game_q, stop,
-                search_kwargs, selfplay_kwargs, study_kwargs, model_kwargs,
-                batch, threads, dev,
-                str(progress_path) if args.schedule else None,
-                args.compile,
-            ),
-            kwargs={"resign_gate_path": str(resign_gate_path)},
-            daemon=True,
+    if args.fast:
+        from prophet.fastplay import fast_vector_worker
+
+        workers = [
+            ctx.Process(
+                target=fast_vector_worker,
+                args=(
+                    i, str(ckpt_path), str(gate_path), game_q, stop,
+                    search_kwargs, selfplay_kwargs, study_kwargs, model_kwargs,
+                    args.fast_threads, args.mega_batch, args.worker_device,
+                    str(progress_path) if args.schedule else None,
+                ),
+                kwargs={
+                    "resign_gate_path": str(resign_gate_path),
+                    "search_batch": args.search_batch,
+                    "stats_path": str(out / "broker_stats.log"),
+                },
+                daemon=True,
+            )
+            for i in range(args.workers)
+        ]
+        layout_str = (
+            f"{args.workers}x[FAST {args.worker_device} {args.fast_threads}thr "
+            f"mega{args.mega_batch} leaf{args.search_batch}]"
         )
-        for i, (dev, batch, threads) in enumerate(layout)
-    ]
+    else:
+        workers = [
+            ctx.Process(
+                target=vector_worker,
+                args=(
+                    i, str(ckpt_path), str(gate_path), game_q, stop,
+                    search_kwargs, selfplay_kwargs, study_kwargs, model_kwargs,
+                    batch, threads, dev,
+                    str(progress_path) if args.schedule else None,
+                    args.compile,
+                ),
+                kwargs={"resign_gate_path": str(resign_gate_path)},
+                daemon=True,
+            )
+            for i, (dev, batch, threads) in enumerate(layout)
+        ]
+        layout_str = ", ".join(
+            f"{n}x[{dev} b{batch} t{threads}]"
+            for (dev, batch, threads), n in
+            [((d, b, t), sum(1 for x in layout if x == (d, b, t)))
+             for d, b, t in dict.fromkeys(layout)]
+        )
     for w in workers:
         w.start()
-    layout_str = ", ".join(
-        f"{n}x[{dev} b{batch} t{threads}]"
-        for (dev, batch, threads), n in
-        [((d, b, t), sum(1 for x in layout if x == (d, b, t)))
-         for d, b, t in dict.fromkeys(layout)]
-    )
     print(
-        f"learner on {device}, {len(layout)} workers ({layout_str}), sims={args.sims}, "
+        f"learner on {device}, {len(workers)} workers ({layout_str}), sims={args.sims}, "
         f"net {model.num_params():,} params, study={'on' if args.study else 'off'}, "
         f"study gate @{args.gate}, resign gate @{args.resign_gate}",
         flush=True,
