@@ -119,7 +119,8 @@ class Game(threading.Thread):
                     # recipe semantics, ~12x the sequential throughput
                     s = RustBatchedSearcher(bot.model, budget=max(64, b),
                                             batch=_BATCH,
-                                            seed=int(rng.integers(1 << 30)))
+                                            seed=int(rng.integers(1 << 30)),
+                                            contempt=0.1)
                     mv, _spent = s.search(board)
                 uci = mv.uci()
                 for attempt in range(3):
