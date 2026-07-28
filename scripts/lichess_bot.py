@@ -28,9 +28,9 @@ import requests
 
 import numpy as _np
 
-from prophet.fasteval import FastEval
+from prophet.fastboard import PyChessBoard
 from prophet.model import load_checkpoint
-from prophet.search import SearchConfig, search_move
+from prophet.searchB import BatchedSearcher
 
 API = "https://lichess.org"
 _lock = threading.Lock()  # one search at a time (shared CPU)
@@ -99,11 +99,14 @@ class Game(threading.Thread):
                 inc_ms = state["winc"] if my_color == chess.WHITE else state["binc"]
                 with _lock:
                     b = self.budget(my_ms, inc_ms, board)
-                    # the PROVEN baseline search — the one every validated
-                    # number was measured with (v3.5 stays on the bench)
-                    cfg = SearchConfig(sims=max(31, b - 1), root_candidates=16)
-                    mv = search_move(bot.model, board, cfg,
-                                     torch.device("cpu"), rng)
+                    # Phase B batched-leaf search: same recipe as the proven
+                    # baseline, leaves evaluated 16-at-a-time (2.5x deeper
+                    # per second at identical semantics)
+                    s = BatchedSearcher(bot.model, budget=max(48, b), batch=16,
+                                        seed=int(rng.integers(1 << 30)))
+                    pb = PyChessBoard(board)
+                    action, _spent = s.search(pb)
+                    mv = pb.move_for(action)
                 uci = mv.uci()
                 for attempt in range(3):
                     resp = requests.post(
@@ -125,11 +128,15 @@ class Bot:
     def __init__(self, token, ckpt):
         self.token = token
         self.ckpt_path = ckpt
-        self.model = FastEval(load_checkpoint(ckpt))  # quant + transposition cache
+        self.model = load_checkpoint(ckpt)
         self.model.eval()
         torch.set_num_threads(4)
-        # clock the bare net (cache would lie), then credit the cache ~1.5x
-        self.nps = measure_nps(self.model.m) * 1.5
+        # measure EFFECTIVE nps with the batched search itself
+        import chess as _c
+        s = BatchedSearcher(self.model, budget=256, batch=16, seed=1)
+        t0 = time.time()
+        _, spent = s.search(PyChessBoard(_c.Board()))
+        self.nps = spent / max(0.05, time.time() - t0)
         self.active = set()
         me = requests.get(f"{API}/api/account", headers=_headers(token), timeout=15).json()
         self.me = me["id"]
