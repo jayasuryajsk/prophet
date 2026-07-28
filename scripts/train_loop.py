@@ -270,6 +270,8 @@ def main():
     )
 
     buffer = ReplayBuffer(args.buffer)
+    prefetcher = None  # created lazily post-warmup on the --fast path
+    ema_p = mod_p = None
     ema = {}
     recent_plies = deque(maxlen=200)
     recent_decisive = deque(maxlen=200)
@@ -324,20 +326,35 @@ def main():
 
             weights = loss_weights_at(games_done) if args.schedule else None
             if len(buffer) >= args.warmup:
+                if args.fast and prefetcher is None:
+                    # fastlearn: batch N+1 assembles on a thread while the GPU
+                    # trains on N; identical batches, same rng order (golden-
+                    # tested by scripts/validate_fastlearn.py)
+                    from prophet.fastlearn import Prefetcher, fused_ema
+                    prefetcher = Prefetcher(buffer, args.batch, rng, device)
+                    ema_p = list(ema_model.parameters())
+                    mod_p = list(model.parameters())
                 steps = max(1, round(len(game.samples) * args.train_ratio / args.batch))
                 for _ in range(steps):
                     if args.lr_warmup_steps > 0:
                         lr_now = args.lr * min(1.0, (total_steps + 1) / args.lr_warmup_steps)
                         for pg in opt.param_groups:
                             pg["lr"] = lr_now
-                    batch = collate(buffer.sample(args.batch, rng), device)
+                    if prefetcher is not None:
+                        batch = prefetcher.next()
+                    else:
+                        batch = collate(buffer.sample(args.batch, rng), device)
                     losses = train_step(model, opt, batch, weights=weights)
                     total_steps += 1
                     for k, v in losses.items():
                         ema[k] = v if k not in ema else 0.99 * ema[k] + 0.01 * v
                     with torch.no_grad():
-                        for pe, p in zip(ema_model.parameters(), model.parameters()):
-                            pe.lerp_(p, 1 - args.ema)
+                        if prefetcher is not None:
+                            from prophet.fastlearn import fused_ema
+                            fused_ema(ema_p, mod_p, args.ema)
+                        else:
+                            for pe, p in zip(ema_model.parameters(), model.parameters()):
+                                pe.lerp_(p, 1 - args.ema)
                         for be, b in zip(ema_model.buffers(), model.buffers()):
                             be.copy_(b)
 
