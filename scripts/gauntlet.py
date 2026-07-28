@@ -57,17 +57,20 @@ def _game_gen(game_idx, seed):
     board = chess.Board()
     pb = PyChessBoard(board)
     plies = 0
+    sans = []  # every move in SAN, so won games can be replayed later
     while _terminal_value(board) is None and plies < MAX_PLIES:
         if board.turn == (chess.WHITE if model_is_white else chess.BLACK):
             res = yield from run_search_gen(pb, _worker["scfg"], rng)
-            board.push(pb.move_for(res.move_index))
+            mv = pb.move_for(res.move_index)
         else:
-            board.push(_worker["engine"].play(board, _worker["limit"]).move)
+            mv = _worker["engine"].play(board, _worker["limit"]).move
+        sans.append(board.san(mv))
+        board.push(mv)
         plies += 1
     if board.is_checkmate():
         winner_is_white = board.turn == chess.BLACK
-        return 1.0 if winner_is_white == model_is_white else 0.0
-    return 0.5
+        return (1.0 if winner_is_white == model_is_white else 0.0, sans)
+    return (0.5, sans)
 
 
 def _play_chunk(chunk):
@@ -93,7 +96,8 @@ def _play_chunk(chunk):
                 pending[i] = gens[i].send((logits[j], q[j], v[j]))
                 still.append(i)
             except StopIteration as e:
-                scores.append((rung, e.value))
+                sc, sans = e.value
+                scores.append((rung, sc, games[i][0] % 2 == 0, sans))
         active = still
     return scores
 
@@ -105,7 +109,7 @@ def expected(e, r):
 def mle_elo(games):
     """Performance rating: E solving sum(expected(E, r)) = sum(score).
     games: list of (rung, score). Returns (elo, is_bound)."""
-    total = sum(s for _, s in games)
+    total = sum(g[1] for g in games)
     n = len(games)
     bound = False
     if total <= 0:
@@ -115,7 +119,7 @@ def mle_elo(games):
     lo, hi = -500.0, 4000.0
     for _ in range(200):
         mid = (lo + hi) / 2
-        if sum(expected(mid, r) for r, _ in games) < total:
+        if sum(expected(mid, g[0]) for g in games) < total:
             lo = mid
         else:
             hi = mid
@@ -170,7 +174,7 @@ def main():
             print(f"  {done}/{n_games} games ({time.perf_counter()-t0:.0f}s)", flush=True)
 
     per_rung = {}
-    for rung, score in results:
+    for rung, score, _w, _s in results:
         w, d, l = per_rung.get(rung, (0, 0, 0))
         per_rung[rung] = (
             w + (score == 1.0),
@@ -186,6 +190,11 @@ def main():
     elo, bound = mle_elo(results)
     tag = "<=" if bound and elo < rungs[0] else (">=" if bound else "")
     print(f"\n  benchmark Elo: {tag} {elo:.0f}")
+    white = [g for g in results if g[2]]
+    black = [g for g in results if not g[2]]
+    elo_white = round(mle_elo(white)[0], 1) if white else None
+    elo_black = round(mle_elo(black)[0], 1) if black else None
+    print(f"  White Elo: {elo_white}   Black Elo: {elo_black}")
 
     if args.out:
         Path(args.out).write_text(
@@ -194,10 +203,17 @@ def main():
                     "ckpt": args.ckpt,
                     "rungs": {str(r): per_rung[r] for r in rungs},
                     "elo": round(elo, 1),
+                    "elo_white": elo_white,
+                    "elo_black": elo_black,
                     "bound": bound,
                     "forwards_cap": args.forwards,
                     "games_per_rung": args.games_per_rung,
                     "official": official,
+                    "games": [
+                        {"rung": r, "model_white": w, "score": s,
+                         "moves": " ".join(sans)}
+                        for r, s, w, sans in results
+                    ],
                 },
                 indent=2,
             )

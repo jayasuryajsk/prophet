@@ -13,6 +13,7 @@ from dataclasses import asdict, dataclass
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from .encoding import FEATURES, NUM_ACTIONS
 
@@ -50,28 +51,42 @@ class PolicyQValueNet(nn.Module):
         d, h = cfg.d_model, cfg.head_dim
         self.p_from = nn.Linear(d, h)
         self.p_to = nn.Linear(d, h)
+        # dueling advantage head: the bilinear from-to scores are RELATIVE
+        # move quality. Q(s,a) = tanh(atanh(v) + A(s,a) - max_legal A) is
+        # composed by the consumers (search / train), where the legal mask is
+        # known — so the best legal move's Q equals v, and every Q-target's
+        # gradient also trains the value stream (V eats Q's dense signal).
         self.q_from = nn.Linear(d, h)
         self.q_to = nn.Linear(d, h)
-        # WDL value head: 3 logits (loss, draw, win) from the side to move's
-        # perspective; the scalar v consumed by search is P(win) - P(loss)
-        self.v_head = nn.Sequential(nn.Linear(d, d), nn.GELU(), nn.Linear(d, 3))
+        # value readout: learned attention pool over the 64 squares (sharp,
+        # localized — king danger lives on specific squares; a mean-pool
+        # smears it) concatenated with the mean, feeding the WDL head
+        # (3 logits L/D/W; scalar v = P(win) - P(loss)) and the moves-left
+        # head (predicted plies to game end — the anti-shuffle signal).
+        self.v_query = nn.Parameter(torch.randn(cfg.d_model) * 0.02)
+        self.v_head = nn.Sequential(nn.Linear(2 * d, d), nn.GELU(), nn.Linear(d, 3))
+        self.mlh_head = nn.Sequential(nn.Linear(2 * d, d // 2), nn.GELU(), nn.Linear(d // 2, 1))
 
     def forward_wdl(self, x: torch.Tensor):
-        """x: [B, 64, F] -> (policy [B,4096], q [B,4096], v [B], wdl [B,3])."""
+        """x: [B, 64, F] -> (policy [B,4096], adv [B,4096], v [B], wdl [B,3],
+        mlh [B]). `adv` is the RAW advantage table — consumers compose
+        Q(s,a) = tanh(atanh(v) + adv - max over LEGAL adv) where the legal
+        mask is known. mlh = predicted plies until the game ends (>= 0)."""
         b = x.shape[0]
         h = self.norm(self.trunk(self.embed(x) + self.pos))
         scale = 1.0 / math.sqrt(self.cfg.head_dim)
         policy = torch.einsum("bid,bjd->bij", self.p_from(h), self.p_to(h)) * scale
-        q = torch.tanh(
-            torch.einsum("bid,bjd->bij", self.q_from(h), self.q_to(h)) * scale
-        )
-        wdl = torch.softmax(self.v_head(h.mean(dim=1)), dim=-1)  # [B, 3] L/D/W
+        adv = torch.einsum("bid,bjd->bij", self.q_from(h), self.q_to(h)) * scale
+        attn = torch.softmax(h @ self.v_query / math.sqrt(self.cfg.d_model), dim=-1)
+        feat = torch.cat([(attn.unsqueeze(-1) * h).sum(dim=1), h.mean(dim=1)], dim=-1)
+        wdl = torch.softmax(self.v_head(feat), dim=-1)  # [B, 3] L/D/W
         v = wdl[:, 2] - wdl[:, 0]
-        return policy.reshape(b, NUM_ACTIONS), q.reshape(b, NUM_ACTIONS), v, wdl
+        mlh = F.softplus(self.mlh_head(feat)).squeeze(-1)
+        return policy.reshape(b, NUM_ACTIONS), adv.reshape(b, NUM_ACTIONS), v, wdl, mlh
 
     def forward(self, x: torch.Tensor):
-        policy, q, v, _ = self.forward_wdl(x)
-        return policy, q, v
+        policy, adv, v, _, _ = self.forward_wdl(x)
+        return policy, adv, v
 
     def num_params(self) -> int:
         return sum(p.numel() for p in self.parameters())

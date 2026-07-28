@@ -46,6 +46,21 @@ from prophet.train import collate, train_step
 from prophet.worker import vector_worker
 
 
+def parse_worker_layout(spec: str, default_threads: int):
+    """'mps:5x64,cpu:3x24x3' -> [(dev, batch, threads), ...] (one per worker)."""
+    out = []
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        dev, rest = part.split(":")
+        fields = rest.lower().split("x")
+        count, batch = int(fields[0]), int(fields[1])
+        threads = int(fields[2]) if len(fields) > 2 else default_threads
+        out.extend([(dev.strip(), batch, threads)] * count)
+    return out
+
+
 def run_eval(model, search_cfg, rng, n_greedy, n_search):
     cpu_model = copy.deepcopy(model).to("cpu").eval()
     dev = torch.device("cpu")
@@ -64,6 +79,13 @@ def main():
     ap.add_argument("--batch-games", type=int, default=48, help="concurrent games per worker")
     ap.add_argument("--worker-threads", type=int, default=2)
     ap.add_argument("--worker-device", default="cpu")
+    ap.add_argument(
+        "--worker-layout",
+        default=None,
+        help="heterogeneous worker spec 'dev:countxbatch[xthreads],...' "
+        "(e.g. 'mps:5x64,cpu:3x24x3'); overrides --workers/--worker-device/"
+        "--batch-games. Uses otherwise-idle CPU cores alongside MPS workers.",
+    )
     ap.add_argument("--sims", type=int, default=16)
     ap.add_argument("--candidates", type=int, default=8)
     ap.add_argument("--max-plies", type=int, default=160)
@@ -76,7 +98,8 @@ def main():
     ap.add_argument("--warmup", type=int, default=5_000)
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--sync-every", type=int, default=25, help="games between weight syncs")
-    ap.add_argument("--gate", type=int, default=2000, help="games before study/resign turn on")
+    ap.add_argument("--gate", type=int, default=2000, help="games before STUDY turns on")
+    ap.add_argument("--resign-gate", type=int, default=2000, help="games before RESIGNATION turns on (separate from --gate: resignation needs only a usable value head and bootstraps the win/loss signal; study needs a matured Q-head)")
     ap.add_argument("--eval-every", type=int, default=500)
     ap.add_argument("--eval-greedy-games", type=int, default=24)
     ap.add_argument("--eval-search-games", type=int, default=8)
@@ -89,8 +112,16 @@ def main():
     ap.add_argument("--branch-plies", type=int, default=16)
     ap.add_argument("--study-weight", type=float, default=2.0)
     ap.add_argument("--init-from", default=None, help="warm-start checkpoint (upgraded in place)")
+    ap.add_argument("--start-game", type=int, default=0, help="resume curriculum/counter/gate at this game # (warm restart)")
+    ap.add_argument("--lr-warmup-steps", type=int, default=0, help="linear LR warmup over this many grad steps (cold-start resume: eases the cold optimizer into --lr while buffer refills)")
+    ap.add_argument("--resume-full", default=None, help="resume from a full-state checkpoint (model+ema+optimizer+counters+buffer) — WARM, no cold-start collapse")
     ap.add_argument("--contempt", type=float, default=0.15)
+    ap.add_argument("--search-contempt", type=float, default=0.0,
+                    help="draw score offset inside search backups (root-player perspective); shapes self-play behavior + policy targets toward conversion")
     ap.add_argument("--win-discount", type=float, default=0.997)
+    ap.add_argument("--pcr-prob", type=float, default=0.0,
+                    help="playout-cap randomization: fraction of FULL-budget moves (0 = off)")
+    ap.add_argument("--pcr-cheap-sims", type=int, default=12)
     ap.add_argument("--ema", type=float, default=0.999, help="weight EMA decay; checkpoints/evals use the EMA")
     ap.add_argument("--schedule", action="store_true", help="game-count curricula for study/q-trust/q-loss (moonshot)")
     ap.add_argument("--compile", action="store_true", help="torch.compile worker inference (CUDA only)")
@@ -102,6 +133,8 @@ def main():
     ckpt_path = out / "latest.pt"
     gate_path = out / "gate_on"
     gate_path.unlink(missing_ok=True)
+    resign_gate_path = out / "resign_on"
+    resign_gate_path.unlink(missing_ok=True)
     progress_path = out / "progress.json"
     metrics_path = out / "metrics.csv"
 
@@ -110,7 +143,7 @@ def main():
         tmp.write_text(json.dumps({"games": games}))
         os.replace(tmp, progress_path)
 
-    write_progress(0)
+    write_progress(args.start_game)
 
     setup_perf(args.device)
     device = torch.device(args.device)
@@ -140,11 +173,14 @@ def main():
     save_checkpoint(ema_model, ckpt_path)
 
     search_cfg = SearchConfig(sims=args.sims, root_candidates=args.candidates)
-    search_kwargs = {"sims": args.sims, "root_candidates": args.candidates}
+    search_kwargs = {"sims": args.sims, "root_candidates": args.candidates,
+                     "contempt": args.search_contempt}
     selfplay_kwargs = {
         "max_plies": args.max_plies,
         "contempt": args.contempt,
         "win_discount": args.win_discount,
+        "pcr_prob": args.pcr_prob,
+        "pcr_cheap_sims": args.pcr_cheap_sims,
     }
     study_kwargs = (
         {
@@ -157,8 +193,19 @@ def main():
         else None
     )
 
+    if args.worker_layout:
+        layout = parse_worker_layout(args.worker_layout, args.worker_threads)
+    else:
+        layout = [(args.worker_device, args.batch_games, args.worker_threads)] * args.workers
+
+    # study telemetry: workers append one line per studied surprise (kind,
+    # game phase, branch-terminal fraction) — inherited via env by spawn.
+    os.environ["PROPHET_STUDY_LOG"] = str(out / "study_telemetry.log")
+
     ctx = mp.get_context("spawn")
-    game_q = ctx.Queue(maxsize=64)
+    # Size the queue so a learner/eval/ckpt stall can't back up and block every
+    # worker on put() (maxsize 64 fills in seconds once worker count is high).
+    game_q = ctx.Queue(maxsize=max(256, 32 * len(layout)))
     stop = ctx.Event()
     workers = [
         ctx.Process(
@@ -166,21 +213,27 @@ def main():
             args=(
                 i, str(ckpt_path), str(gate_path), game_q, stop,
                 search_kwargs, selfplay_kwargs, study_kwargs, model_kwargs,
-                args.batch_games, args.worker_threads, args.worker_device,
+                batch, threads, dev,
                 str(progress_path) if args.schedule else None,
                 args.compile,
             ),
+            kwargs={"resign_gate_path": str(resign_gate_path)},
             daemon=True,
         )
-        for i in range(args.workers)
+        for i, (dev, batch, threads) in enumerate(layout)
     ]
     for w in workers:
         w.start()
+    layout_str = ", ".join(
+        f"{n}x[{dev} b{batch} t{threads}]"
+        for (dev, batch, threads), n in
+        [((d, b, t), sum(1 for x in layout if x == (d, b, t)))
+         for d, b, t in dict.fromkeys(layout)]
+    )
     print(
-        f"learner on {device}, {args.workers} workers x {args.batch_games} games "
-        f"({args.worker_device}, {args.worker_threads} threads), sims={args.sims}, "
+        f"learner on {device}, {len(layout)} workers ({layout_str}), sims={args.sims}, "
         f"net {model.num_params():,} params, study={'on' if args.study else 'off'}, "
-        f"gate at {args.gate} games",
+        f"study gate @{args.gate}, resign gate @{args.resign_gate}",
         flush=True,
     )
 
@@ -188,9 +241,22 @@ def main():
     ema = {}
     recent_plies = deque(maxlen=200)
     recent_decisive = deque(maxlen=200)
-    games_done = 0
+    recent_study = deque(maxlen=200)
+    games_done = args.start_game
     total_steps = 0
     gated = False
+    resign_gated = False
+    if args.resume_full:
+        fs = torch.load(args.resume_full, map_location=device, weights_only=False)
+        model.load_state_dict(fs["model"]); ema_model.load_state_dict(fs["ema"]); opt.load_state_dict(fs["opt"])
+        games_done = fs["games_done"]; total_steps = fs["total_steps"]
+        rng.bit_generator.state = fs["np_rng"]; torch.set_rng_state(fs["torch_rng"].cpu())
+        if fs.get("buffer"): buffer.data.extend(fs["buffer"])
+        gated = games_done >= args.gate; resign_gated = games_done >= args.resign_gate
+        if gated and args.study: gate_path.touch()
+        if resign_gated: resign_gate_path.touch()
+        save_checkpoint(ema_model, ckpt_path); write_progress(games_done)
+        print(f"RESUMED FULL STATE from {args.resume_full}: game {games_done}, steps {total_steps}, buffer {len(buffer)}", flush=True)
     t0 = time.time()
 
     new_metrics = not metrics_path.exists()
@@ -213,16 +279,25 @@ def main():
             games_done += 1
             recent_plies.append(game.plies)
             recent_decisive.append(0 if game.result in ("1/2-1/2", "*") else 1)
+            recent_study.append(max(0, len(game.samples) - game.plies))   # study rows this game (self-play ~= plies)
 
+            if not resign_gated and games_done >= args.resign_gate:
+                resign_gate_path.touch()
+                resign_gated = True
+                print(f"  RESIGN GATE @{games_done}: resignation enabled", flush=True)
             if not gated and games_done >= args.gate:
                 gate_path.touch()
                 gated = True
-                print(f"  GATE OPEN @{games_done}: study/resignation enabled", flush=True)
+                print(f"  STUDY GATE @{games_done}: study enabled", flush=True)
 
             weights = loss_weights_at(games_done) if args.schedule else None
             if len(buffer) >= args.warmup:
                 steps = max(1, round(len(game.samples) * args.train_ratio / args.batch))
                 for _ in range(steps):
+                    if args.lr_warmup_steps > 0:
+                        lr_now = args.lr * min(1.0, (total_steps + 1) / args.lr_warmup_steps)
+                        for pg in opt.param_groups:
+                            pg["lr"] = lr_now
                     batch = collate(buffer.sample(args.batch, rng), device)
                     losses = train_step(model, opt, batch, weights=weights)
                     total_steps += 1
@@ -250,6 +325,7 @@ def main():
                 print(
                     f"[{games_done}/{args.games}] {loss_str} | "
                     f"plies {np.mean(recent_plies):.0f} decisive {np.mean(recent_decisive):.0%} | "
+                    f"study {np.mean(recent_study):.0f}r/g {np.mean(recent_study)/max(1.0,np.mean(recent_plies)):.1f}x | "
                     f"buffer {len(buffer)} steps {total_steps} | "
                     f"{gpm:.1f} g/min eta {eta_h:.1f}h",
                     flush=True,
@@ -258,6 +334,15 @@ def main():
             if games_done % args.eval_every == 0 or games_done == args.games:
                 save_checkpoint(ema_model, ckpt_path)
                 save_checkpoint(ema_model, out / f"ckpt_{games_done:06d}.pt")
+                # FULL STATE (crash-resumable, no cold-start): weights+ema+opt+counters+rng every eval;
+                # add the heavy 300k buffer only every 10k (the true warm-resume point).
+                _fs = {"model": model.state_dict(), "ema": ema_model.state_dict(), "opt": opt.state_dict(),
+                       "games_done": games_done, "total_steps": total_steps, "model_kwargs": model_kwargs,
+                       "np_rng": rng.bit_generator.state, "torch_rng": torch.get_rng_state()}
+                _t = out / "full_state.pt.tmp"; torch.save(_fs, _t); os.replace(_t, out / "full_state.pt")
+                if games_done % 10000 == 0:
+                    _fs["buffer"] = list(buffer.data)
+                    _t2 = out / "full_resume.pt.tmp"; torch.save(_fs, _t2); os.replace(_t2, out / "full_resume.pt")
                 if args.no_eval:
                     # in-loop vs-random eval stalls the run (single-core eval
                     # starved by the workers) and is uninformative; use the

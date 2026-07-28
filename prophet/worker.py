@@ -18,7 +18,8 @@ from dataclasses import replace
 
 import numpy as np
 
-from .accel import autocast, maybe_compile, setup_perf, to_np
+from .accel import autocast, maybe_compile, setup_perf, to_np  # noqa: F401
+from .encoding import FEATURES, NUM_ACTIONS
 from .model import ModelConfig, PolicyQValueNet, extract_state
 from .schedule import q_trust_at, study_config_at
 from .search import SearchConfig
@@ -28,11 +29,15 @@ from .study import StudyConfig, study_game_gen
 RELOAD_EVERY_ROUNDS = 32
 
 
-def episode_gen(scfg, spcfg, stcfg, rng, gate_fn):
-    """One full episode: a game, plus study if the gate is open."""
-    gate = gate_fn()
-    record = yield from play_game_gen(scfg, spcfg, rng, resign_enabled=gate)
-    if stcfg is not None and gate:
+def episode_gen(scfg, spcfg, stcfg, rng, gate_fn, resign_gate_fn=None):
+    """One full episode: a game, plus study if the study gate is open.
+    Resignation gates separately (resign_gate_fn) so it can switch on EARLIER
+    than study: resignation needs only a usable value head, study needs a
+    matured Q-head. Defaults to the study gate when no separate gate is given."""
+    if resign_gate_fn is None:
+        resign_gate_fn = gate_fn
+    record = yield from play_game_gen(scfg, spcfg, rng, resign_enabled=resign_gate_fn())
+    if stcfg is not None and gate_fn():
         extra = yield from study_game_gen(record, scfg, stcfg, rng)
         record.samples.extend(extra)
     return record
@@ -51,6 +56,7 @@ def run_vector_selfplay(
     should_stop,
     on_round=None,
     cfg_fn=None,
+    resign_gate_fn=None,
 ):
     """Core driver loop. Calls on_record(record) for each finished episode;
     runs until should_stop() is true. cfg_fn(), if given, returns the
@@ -59,7 +65,7 @@ def run_vector_selfplay(
     def new_episode():
         rng = np.random.default_rng(int(master_rng.integers(2**63)))
         s_cfg, st_cfg = cfg_fn() if cfg_fn is not None else (scfg, stcfg)
-        gen = episode_gen(s_cfg, spcfg, st_cfg, rng, gate_fn)
+        gen = episode_gen(s_cfg, spcfg, st_cfg, rng, gate_fn, resign_gate_fn)
         return gen, gen.send(None)
 
     gens, pending = [], []
@@ -68,19 +74,28 @@ def run_vector_selfplay(
         gens.append(g)
         pending.append(x)
 
+    # Persistent host+device staging buffers: each round restacks the pending
+    # leaf features into the same host array and copies once to the GPU, so the
+    # hot loop allocates nothing per round. Reuse is safe because the packed
+    # D2H below fully syncs the round before the next stack overwrites cpu_stage.
+    na = NUM_ACTIONS
+    cpu_stage = np.empty((batch_games, 64, FEATURES), dtype=np.float32)
+    dev_stage = torch.empty((batch_games, 64, FEATURES), device=device)
+
     rounds = 0
     while not should_stop():
         if on_round is not None and rounds % RELOAD_EVERY_ROUNDS == 0:
             on_round(rounds)
-        xb = torch.from_numpy(np.stack(pending)).to(device)
+        np.stack(pending, out=cpu_stage)
+        dev_stage.copy_(torch.from_numpy(cpu_stage), non_blocking=True)
         with torch.inference_mode(), autocast(device):
-            logits, q, v = model(xb)
-        logits = to_np(logits)
-        q = to_np(q)
-        v = to_np(v)
+            logits, q, v = model(dev_stage)
+        # ONE packed GPU->CPU transfer/sync instead of three separate .cpu()
+        # round-trips: cat [B,4096]|[B,4096]|[B,1] -> [B,8193], slice on host.
+        arr = torch.cat([logits, q, v[:, None]], dim=1).float().cpu().numpy()
         for i in range(len(gens)):
             try:
-                pending[i] = gens[i].send((logits[i], q[i], v[i]))
+                pending[i] = gens[i].send((arr[i, :na], arr[i, na : 2 * na], arr[i, 2 * na]))
             except StopIteration as e:
                 if not on_record(e.value):
                     return
@@ -103,8 +118,17 @@ def vector_worker(
     device_str: str = "cpu",
     progress_path: str | None = None,
     compile_model: bool = False,
+    resign_gate_path: str | None = None,
 ):
     torch.set_num_threads(threads)
+    # In a hybrid CPU+MPS layout, nice the CPU workers down so their heavy CPU
+    # forwards don't preempt the MPS workers' latency-sensitive single-threaded
+    # tree-ops (which is what actually feeds the GPU).
+    if str(device_str).startswith("cpu"):
+        try:
+            os.nice(10)
+        except OSError:
+            pass
     setup_perf(device_str)
     device = torch.device(device_str)
     model = PolicyQValueNet(ModelConfig(**model_kwargs)).to(device)
@@ -155,6 +179,7 @@ def vector_worker(
         spcfg,
         stcfg,
         gate_fn=lambda: os.path.exists(gate_path),
+        resign_gate_fn=(lambda: os.path.exists(resign_gate_path)) if resign_gate_path else None,
         batch_games=batch_games,
         master_rng=master_rng,
         on_record=on_record,

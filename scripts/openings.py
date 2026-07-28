@@ -21,7 +21,7 @@ import numpy as np
 
 from prophet.encoding import encode_board, legal_move_map
 from prophet.model import load_checkpoint
-from prophet.search import SearchConfig, _terminal_value, run_search
+from prophet.search import SearchConfig, _terminal_value, search_move
 
 
 @torch.no_grad()
@@ -33,11 +33,15 @@ def top_moves(model, board, k=5):
     idx = np.fromiter(legal.keys(), dtype=np.int64)
     lg = logits[idx] - logits[idx].max()
     p = np.exp(lg) / np.exp(lg).sum()
+    # dueling composition (q from the net is the raw advantage table)
+    vf = float(v[0])
+    a = q[idx]
+    qc = np.tanh(np.arctanh(np.clip(vf, -0.997, 0.997)) + a - a.max())
     order = np.argsort(-p)[:k]
     return [
-        (board.san(legal[int(idx[j])]), float(p[j]), float(q[idx[j]]))
+        (board.san(legal[int(idx[j])]), float(p[j]), float(qc[j]))
         for j in order
-    ], float(v[0])
+    ], vf
 
 
 def main():
@@ -74,9 +78,9 @@ def main():
         board = chess.Board()
         sans = []
         while _terminal_value(board) is None and len(sans) < args.plies:
-            res = run_search(model, board, scfg, torch.device("cpu"), rng)
-            sans.append(board.san(res.move))
-            board.push(res.move)
+            move = search_move(model, board, scfg, torch.device("cpu"), rng)
+            sans.append(board.san(move))
+            board.push(move)
         lines.append(sans)
 
     for depth, label in [(1, "first move"), (2, "first 2 plies"), (6, "first 6 plies")]:

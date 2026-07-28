@@ -20,7 +20,8 @@ can batch study evals alongside game evals; study_game() is the
 synchronous wrapper.
 """
 
-from dataclasses import dataclass
+import os
+from dataclasses import dataclass, replace
 
 import numpy as np
 
@@ -41,10 +42,14 @@ class StudyConfig:
     outcome_mix: float = 0.5
     n_lines: int = 1  # alternate lines explored per surprise position
     q_surprise_weight: float = 1.0  # weight of Q-head surprise in detection
+    contempt: float = 0.15  # draw taste for branch outcome targets (matches selfplay)
+    conv_threshold: float = 0.3  # root value >= this while scoring <= draw => conversion failure
+    conv_branch_plies: int = 120  # conversion branches roll (nearly) to terminal
 
 
-def find_surprises(record: GameRecord, cfg: StudyConfig) -> list[int]:
-    """Indices of the most surprising plies, by:
+def find_surprises(record: GameRecord, cfg: StudyConfig) -> list[tuple[int, str]]:
+    """(ply, kind) pairs for the most surprising plies — kind "tact" =
+    blunder/tactical surprise, "conv" = squandered advantage — scored by:
       - blunder swing: value flipped against the mover after the move
       - outcome miss: search value disagreed with the eventual result
       - Q-surprise: the Q-head's value for the move it played diverged from
@@ -54,23 +59,30 @@ def find_surprises(record: GameRecord, cfg: StudyConfig) -> list[int]:
     """
     v = record.root_values
     qhp = record.q_head_played
-    z_white = {"1-0": 1.0, "0-1": -1.0, "1/2-1/2": 0.0}.get(record.result)
+    # "*" = ply-cap truncation, scored as a draw: squandered advantages must
+    # register as outcome misses, or conversion failure is invisible to study.
+    z_white = {"1-0": 1.0, "0-1": -1.0, "1/2-1/2": 0.0, "*": 0.0}.get(record.result)
     mover_white = [fen.split()[1] == "w" for fen in record.fens]
-    scores = []
+    scores, kinds = [], []
     for t in range(len(v)):
         swing = max(0.0, v[t] + v[t + 1]) if t + 1 < len(v) else 0.0
         outcome = 0.0
+        dissip = 0.0
         if z_white is not None:
             z_t = z_white if mover_white[t] else -z_white
             outcome = abs(v[t] - z_t)
+            if z_t <= 0.0:
+                # held an advantage here yet scored <= draw: squandering
+                dissip = max(0.0, v[t])
         # Q-head predicted qhp[t] for the played move; it actually led to a
         # position worth -v[t+1] to the mover. The gap is the Q-surprise.
         q_surprise = 0.0
         if qhp is not None and t + 1 < len(v):
             q_surprise = abs(qhp[t] + v[t + 1])
-        scores.append(swing + 0.5 * outcome + cfg.q_surprise_weight * q_surprise)
+        scores.append(swing + 0.5 * outcome + cfg.q_surprise_weight * q_surprise + 0.5 * dissip)
+        kinds.append("conv" if dissip >= cfg.conv_threshold else "tact")
     order = sorted(range(len(v)), key=lambda t: -scores[t])
-    return [t for t in order[: cfg.top_k] if scores[t] >= cfg.min_surprise]
+    return [(t, kinds[t]) for t in order[: cfg.top_k] if scores[t] >= cfg.min_surprise]
 
 
 def _top_line_indices(res, n: int) -> list[int]:
@@ -121,6 +133,8 @@ def _play_branch_gen(board, scfg, cfg, rng):
             z_white = 0.0
         for s, mover_was_white in raw:
             z = z_white if mover_was_white else -z_white
+            if z == 0.0:
+                z = -cfg.contempt  # branch draws taste bad too
             s.value_target = (1 - cfg.outcome_mix) * s.value_target + cfg.outcome_mix * z
     return [s for s, _ in raw]
 
@@ -137,9 +151,11 @@ def study_game_gen(
         sims=cfg.deep_sims,
         root_candidates=cfg.deep_candidates,
         q_trust=scfg.q_trust,
+        contempt=scfg.contempt,
     )
     out = []
-    for t in find_surprises(record, cfg):
+    telem = os.environ.get("PROPHET_STUDY_LOG")
+    for t, kind in find_surprises(record, cfg):
         board = board_from_fen(record.fens[t])
         res = yield from run_search_gen(board, deep_cfg, rng)
         out.append(_sample_from_search(board, res, res.root_value, cfg.study_weight))
@@ -149,10 +165,25 @@ def study_game_gen(
         # Each line gets a FRESH board from the surprise FEN — _play_branch_gen
         # advances the board it's given and does not rewind it, so a shared
         # board would leave stale state for the next line (illegal-action crash).
+        # conversion failures get long branches: roll the deep search's
+        # preferred lines (nearly) to terminal so squandered endgames
+        # produce REAL outcome bits instead of echoed search values.
+        bcfg = replace(cfg, branch_plies=cfg.conv_branch_plies) if kind == "conv" else cfg
+        n_br = n_term = 0
         for mv_idx in _top_line_indices(res, cfg.n_lines):
             branch_board = board_from_fen(record.fens[t])
             branch_board.push_action(int(mv_idx))
-            out.extend((yield from _play_branch_gen(branch_board, scfg, cfg, rng)))
+            out.extend((yield from _play_branch_gen(branch_board, scfg, bcfg, rng)))
+            n_br += 1
+            n_term += branch_board.terminal_value() is not None
+        if telem:
+            try:
+                with open(telem, "a") as f:
+                    f.write(
+                        f"{kind} ply={t}/{record.plies} res={record.result} term={n_term}/{n_br}\n"
+                    )
+            except OSError:
+                pass
     return out
 
 

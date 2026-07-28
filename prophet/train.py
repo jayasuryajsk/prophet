@@ -18,6 +18,7 @@ class LossWeights:
     q: float = 1.0
     consistency: float = 0.5
     wdl: float = 0.5
+    mlh: float = 0.1
 
 
 def collate(samples, device):
@@ -28,6 +29,12 @@ def collate(samples, device):
     value = torch.tensor([s.value_target for s in samples], device=device)
     weight = torch.tensor([s.weight for s in samples], device=device)
     wdl = torch.tensor([getattr(s, "wdl", -1) for s in samples], device=device)
+    moves_left = torch.tensor(
+        [getattr(s, "moves_left", -1.0) for s in samples], device=device
+    )
+    policy_ok = torch.tensor(
+        [getattr(s, "policy_ok", True) for s in samples], device=device
+    )
 
     mask = torch.zeros(b, NUM_ACTIONS, dtype=torch.bool)
     policy = torch.zeros(b, NUM_ACTIONS)
@@ -46,6 +53,8 @@ def collate(samples, device):
         "value": value,
         "weight": weight,
         "wdl": wdl,
+        "moves_left": moves_left,
+        "policy_ok": policy_ok,
         "mask": mask.to(device),
         "policy": policy.to(device),
         "q_target": q_target.to(device),
@@ -57,14 +66,27 @@ def train_step(model, optimizer, batch, weights: LossWeights | None = None):
     w = weights or LossWeights()
     model.train()
     with autocast(batch["x"].device):
-        logits, q, v, wdl_probs = model.forward_wdl(batch["x"])
+        logits, adv, v, wdl_probs, mlh = model.forward_wdl(batch["x"])
 
         wn = batch["weight"] / batch["weight"].mean().clamp_min(1e-8)
+
+        # dueling composition under the LEGAL mask: the best legal move's Q
+        # equals v, so every Q-target gradient also trains the value stream —
+        # the value head eats the Q head's dense per-move signal.
+        a_masked = adv.masked_fill(~batch["mask"], float("-inf"))
+        a_max = a_masked.max(dim=-1, keepdim=True).values
+        q = torch.tanh(
+            torch.atanh(v.clamp(-0.997, 0.997)).unsqueeze(1) + adv - a_max
+        )
 
         masked = logits.masked_fill(~batch["mask"], float("-inf"))
         logp = F.log_softmax(masked, dim=-1)
         logp = torch.where(batch["mask"], logp, torch.zeros_like(logp))
-        loss_pi = (wn * -(batch["policy"] * logp).sum(dim=-1)).mean()
+        # PCR: cheap-search moves carry no usable policy target — the policy
+        # trains only on full-budget searches (value/Q/WDL/MLH train on all).
+        pok = batch["policy_ok"]
+        per_pi = wn * -(batch["policy"] * logp).sum(dim=-1)
+        loss_pi = (per_pi * pok).sum() / pok.sum().clamp_min(1)
 
         loss_v = (wn * (v - batch["value"]).pow(2)).mean()
 
@@ -88,9 +110,20 @@ def train_step(model, optimizer, batch, weights: LossWeights | None = None):
         q_played = q.gather(1, batch["played"].unsqueeze(1)).squeeze(1)
         loss_cons = (wn * (q_played + v_child).pow(2)).mean()
 
+        # moves-left: predict plies until the game ends (anti-shuffle signal;
+        # scaled Huber so long-game errors don't dominate)
+        ml = batch["moves_left"]
+        has_ml = ml >= 0
+        if has_ml.any():
+            per_ml = F.smooth_l1_loss(mlh / 20.0, ml / 20.0, reduction="none")
+            loss_mlh = (wn * per_ml * has_ml).sum() / has_ml.sum().clamp_min(1)
+        else:
+            loss_mlh = torch.zeros((), device=v.device)
+
         loss = (
             w.policy * loss_pi + w.value * loss_v + w.q * loss_q
             + w.consistency * loss_cons + w.wdl * loss_wdl
+            + w.mlh * loss_mlh
         )
     optimizer.zero_grad(set_to_none=True)
     loss.backward()
@@ -103,4 +136,5 @@ def train_step(model, optimizer, batch, weights: LossWeights | None = None):
         "q": loss_q.item(),
         "consistency": loss_cons.item(),
         "wdl": loss_wdl.item(),
+        "mlh": loss_mlh.item(),
     }
