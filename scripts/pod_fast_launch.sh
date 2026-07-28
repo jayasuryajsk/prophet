@@ -23,6 +23,8 @@ MEGA="${MEGA:-1024}"
 WORKERS="${WORKERS:-1}"   # fast worker PROCESSES (one GIL each; >1 when the
                           # glue lane, not the GPU, is the bottleneck)
 RESUME="${RESUME:-}"      # path to full_resume.pt for a warm restart
+LEARNER_DEV="${LEARNER_DEV:-cuda}"  # multi-GPU: learner on its own card
+WORKER_DEV="${WORKER_DEV:-cuda}"    # (e.g. LEARNER_DEV=cuda:1 WORKER_DEV=cuda:0)
 
 mkdir -p "$OUT"
 cd "$(dirname "$0")/.."
@@ -30,7 +32,7 @@ cd "$(dirname "$0")/.."
 nohup python3 scripts/train_loop.py \
   --games "$GAMES" \
   --fast --fast-threads "$THREADS" --mega-batch "$MEGA" --search-batch 32 \
-  --workers "$WORKERS" --worker-device cuda --device cuda \
+  --workers "$WORKERS" --worker-device "$WORKER_DEV" --device "$LEARNER_DEV" \
   ${RESUME:+--resume-full "$RESUME"} \
   --d-model 320 --n-layers 8 --n-heads 8 \
   --sims 32 --candidates 8 \
