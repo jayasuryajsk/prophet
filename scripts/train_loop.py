@@ -128,6 +128,12 @@ def main():
     ap.add_argument("--fast", action="store_true",
                     help="Rust-max workers: threaded games on Rust search trees, "
                     "one mega-batch eval broker per worker (see prophet/fastplay.py)")
+    ap.add_argument("--ingest-port", type=int, default=0,
+                    help="accept streamed GameRecords from gen pods on this port "
+                    "(fleet mode; see prophet/stream.py + scripts/gen_node.py)")
+    ap.add_argument("--serve-http", type=int, default=0,
+                    help="serve the run dir over HTTP on this port (gen pods "
+                    "mirror latest.pt/progress.json/gates from it)")
     ap.add_argument("--fast-threads", type=int, default=16, help="game threads per fast worker")
     ap.add_argument("--mega-batch", type=int, default=512, help="fast worker: max positions per GPU forward")
     ap.add_argument("--search-batch", type=int, default=32, help="fast worker: leaves per tree collect")
@@ -144,9 +150,11 @@ def main():
     progress_path = out / "progress.json"
     metrics_path = out / "metrics.csv"
 
-    def write_progress(games):
+    def write_progress(games, study_gate=False, resign_gate=False):
         tmp = progress_path.with_suffix(".tmp")
-        tmp.write_text(json.dumps({"games": games}))
+        tmp.write_text(json.dumps(
+            {"games": games, "study_gate": study_gate, "resign_gate": resign_gate}
+        ))
         os.replace(tmp, progress_path)
 
     write_progress(args.start_game)
@@ -269,6 +277,26 @@ def main():
         flush=True,
     )
 
+    ingest_stats = None
+    if args.ingest_port:
+        from prophet.stream import record_server
+
+        ingest_stats = record_server(args.ingest_port, game_q, stop)
+        print(f"  FLEET: ingesting gen-pod records on :{args.ingest_port}", flush=True)
+    if args.serve_http:
+        import functools
+        import threading as _th
+        from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+
+        class _Quiet(SimpleHTTPRequestHandler):
+            def log_message(self, *a):  # noqa: N802
+                pass
+
+        handler = functools.partial(_Quiet, directory=str(out))
+        httpd = ThreadingHTTPServer(("0.0.0.0", args.serve_http), handler)
+        _th.Thread(target=httpd.serve_forever, daemon=True).start()
+        print(f"  FLEET: run dir served on :{args.serve_http}", flush=True)
+
     buffer = ReplayBuffer(args.buffer)
     prefetcher = None  # created lazily post-warmup on the --fast path
     ema_p = mod_p = None
@@ -360,7 +388,7 @@ def main():
 
             if games_done % args.sync_every == 0:
                 save_checkpoint(ema_model, ckpt_path)
-                write_progress(games_done)
+                write_progress(games_done, gated and args.study, resign_gated)
 
             if games_done % args.log_every == 0:
                 gpm = games_done / max(1e-9, (time.time() - t0) / 60)
