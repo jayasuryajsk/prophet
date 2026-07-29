@@ -37,6 +37,10 @@ def main():
     ap.add_argument("--search-batch", type=int, default=32)
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--local-dir", default="/workspace/genmirror")
+    ap.add_argument("--ckpt-every", type=float, default=20.0,
+                    help="seconds between weight refreshes from the learner. "
+                    "At swarm velocity, stale weights mean off-policy games — "
+                    "90s cost ~10x learning efficiency at 94 g/min")
     # recipe args — MUST match the learner's run
     ap.add_argument("--sims", type=int, default=32)
     ap.add_argument("--candidates", type=int, default=8)
@@ -58,7 +62,8 @@ def main():
 
     from prophet.fastplay import fast_vector_worker
 
-    mirror = ControlMirror(args.control, args.local_dir)
+    mirror = ControlMirror(args.control, args.local_dir,
+                           ckpt_every=args.ckpt_every, poll=10.0)
     print(f"[gen] fetching initial weights from {args.control} ...", flush=True)
     mirror.start()
     print("[gen] control mirror live", flush=True)
