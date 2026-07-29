@@ -17,10 +17,24 @@ pipeline already trusts.
 """
 
 import os
+import pickle
 import queue as queue_mod
 import threading
 import time
+import zlib
 from multiprocessing.connection import Client, Listener
+
+# Records are pickles of mostly-zero float32 planes — zlib level 1 shrinks
+# them ~15-20x, which is the difference between a community pod's uplink
+# carrying 0.2 games/s and 4+ games/s.
+
+
+def _pack_record(rec) -> bytes:
+    return zlib.compress(pickle.dumps(rec, protocol=5), 1)
+
+
+def _unpack_record(b: bytes):
+    return pickle.loads(zlib.decompress(b))
 
 
 def _authkey():
@@ -50,7 +64,7 @@ def record_server(port, game_q, stop_event, stats=None):
             while not stop_event.is_set():
                 if not conn.poll(1.0):
                     continue
-                rec = conn.recv()
+                rec = _unpack_record(conn.recv_bytes())
                 while not stop_event.is_set():
                     try:
                         game_q.put(rec, timeout=1.0)
@@ -133,10 +147,10 @@ class RecordSink:
             try:
                 if pending is None:
                     try:
-                        pending = self.q.get(timeout=1.0)
+                        pending = _pack_record(self.q.get(timeout=1.0))
                     except queue_mod.Empty:
                         continue
-                conn.send(pending)
+                conn.send_bytes(pending)
                 self.sent += 1
                 pending = None  # only clear after a successful send
             except (BrokenPipeError, ConnectionError, OSError):
