@@ -25,6 +25,7 @@ WORKERS="${WORKERS:-1}"   # fast worker PROCESSES (one GIL each; >1 when the
 RESUME="${RESUME:-}"      # path to full_resume.pt for a warm restart
 LEARNER_DEV="${LEARNER_DEV:-cuda}"  # multi-GPU: learner on its own card
 WORKER_DEV="${WORKER_DEV:-cuda}"    # (e.g. LEARNER_DEV=cuda:1 WORKER_DEV=cuda:0)
+STUDY="${STUDY:-1}"                 # STUDY=0: reflection off (A/B arm B)
 
 mkdir -p "$OUT"
 cd "$(dirname "$0")/.."
@@ -40,7 +41,7 @@ nohup python3 scripts/train_loop.py \
   --max-plies 160 \
   --buffer 300000 \
   --contempt 0.15 --search-contempt 0.15 --win-discount 0.997 \
-  --study --schedule --no-eval \
+  $([ "$STUDY" = "1" ] && echo "--study") --schedule --no-eval \
   --out "$OUT" \
   > "$OUT/train.log" 2>&1 &
 
